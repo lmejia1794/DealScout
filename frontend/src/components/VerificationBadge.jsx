@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { useSettings } from './SettingsContext'
+import { API_BASE } from '../config'
 
 // Human-readable labels for field names
 export const FIELD_LABELS = {
@@ -197,7 +198,7 @@ export default function VerificationBadge({
       setToast(null)
       setShowTooltip(false)
       try {
-        const resp = await fetch('/api/verify/field', {
+        const resp = await fetch(`${API_BASE}/api/verify/field`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

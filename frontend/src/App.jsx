@@ -10,6 +10,7 @@ import CompanyModal from './components/CompanyModal'
 import ComparablesPanel from './components/ComparablesPanel'
 import ReportActionBar from './components/ReportActionBar'
 import { useSettings } from './components/SettingsContext'
+import { API_BASE } from './config'
 
 const PHASES = [
   { marker: 'Step 0',  label: 'Discovering sources...' },
@@ -298,7 +299,7 @@ export default function App() {
     setProfiles({})
 
     try {
-      const response = await fetch('/api/research', {
+      const response = await fetch(`${API_BASE}/api/research`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ thesis, known_companies, settings }),
@@ -435,7 +436,7 @@ export default function App() {
   // Fetch a profile silently (no UI) — used when building the report
   const fetchProfileSilent = async (company) => {
     try {
-      const resp = await fetch('/api/company/profile', {
+      const resp = await fetch(`${API_BASE}/api/company/profile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company, thesis: currentThesis, settings }),

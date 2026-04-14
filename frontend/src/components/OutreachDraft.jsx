@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { API_BASE } from '../config'
 
 export default function OutreachDraft({ company, profile, thesis }) {
   const [state, setstate] = useState('idle') // idle | loading | done | error
@@ -9,7 +10,7 @@ export default function OutreachDraft({ company, profile, thesis }) {
   async function draft() {
     setstate('loading')
     try {
-      const resp = await fetch('/api/company/outreach', {
+      const resp = await fetch(`${API_BASE}/api/company/outreach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company, profile, thesis }),

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
+import { API_BASE } from '../config'
 import ReactMarkdown from 'react-markdown'
 import ServiceMap from './ServiceMap'
 import DecisionMakers from './DecisionMakers'
@@ -279,7 +280,7 @@ export default function CompanyModal({ company, thesis, comparables, onProfileLo
     setProfile(null)
 
     try {
-      const resp = await fetch('/api/company/profile', {
+      const resp = await fetch(`${API_BASE}/api/company/profile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company, thesis, settings }),

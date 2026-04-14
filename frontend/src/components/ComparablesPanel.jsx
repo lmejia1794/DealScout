@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react'
+import { API_BASE } from '../config'
 
 function dealTypeClass(type) {
   const t = (type || '').toLowerCase()
@@ -68,7 +69,7 @@ export default function ComparablesPanel({ thesis, sectorBrief, transactions, on
     setError('')
 
     try {
-      const resp = await fetch('/api/comparables', {
+      const resp = await fetch(`${API_BASE}/api/comparables`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ thesis, sector_brief: sectorBrief }),
