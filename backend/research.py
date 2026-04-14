@@ -33,7 +33,7 @@ SYSTEM_PROMPT = (
     "When asked to return markdown, return only markdown."
 )
 TEMPERATURE = 0.2
-JSON_TOKENS = 2000
+JSON_TOKENS = 8000
 BRIEF_TOKENS = 6000  # explicit large limit — avoids Ollama misinterpreting num_predict=-1
 
 # Maximum characters of Tavily web context to inject per prompt.
