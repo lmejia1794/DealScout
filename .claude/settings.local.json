@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(npm install:*)",
+      "Bash(.venv/bin/pip show:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(PYTHONPATH=. .venv/bin/python:*)",
+      "Bash(npm list:*)",
+      "Bash(python -c \"import main; print\\('OK'\\)\")",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}

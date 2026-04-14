@@ -1,0 +1,8 @@
+@media print {
+  .no-print { display: none !important; }
+  body { font-size: 11pt; }
+  h1 { font-size: 18pt; }
+  h2 { font-size: 14pt; }
+  .page-break { page-break-after: always; }
+  a { color: inherit; text-decoration: none; }
+}
