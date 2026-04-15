@@ -1,6 +1,8 @@
 import React from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 
+const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
+
 const COUNTRY_FLAGS = {
   Germany: '🇩🇪', Austria: '🇦🇹', Switzerland: '🇨🇭',
   France: '🇫🇷', Netherlands: '🇳🇱', Belgium: '🇧🇪',
@@ -25,19 +27,20 @@ function normalizeItem(item) {
 
 // Returns { displayValue, originalValue, isReplaced }
 function resolveValue(original, verification, fieldName) {
-  if (!verification) return { displayValue: original, originalValue: original, isReplaced: false }
+  const orig = stripCitations(original)
+  if (!verification) return { displayValue: orig, originalValue: orig, isReplaced: false }
   const status = verification.status
   const corrected = verification.corrected_value
   const override = verification.human_override
   const canReplace = AUTO_REPLACE_FIELDS.has(fieldName) && corrected
 
   if (canReplace && status === 'contradicted' && (!override || override === 'confirmed')) {
-    return { displayValue: corrected, originalValue: original, isReplaced: true }
+    return { displayValue: stripCitations(corrected), originalValue: orig, isReplaced: true }
   }
   if (canReplace && override === 'disputed') {
-    return { displayValue: original, originalValue: original, isReplaced: false }
+    return { displayValue: orig, originalValue: orig, isReplaced: false }
   }
-  return { displayValue: original, originalValue: original, isReplaced: false }
+  return { displayValue: orig, originalValue: orig, isReplaced: false }
 }
 
 // Underline style based on verification status
@@ -177,13 +180,13 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
         </div>
       )}
 
-      <p className="text-sm text-gray-600 leading-relaxed">{company.description}</p>
-      <p className="text-xs text-gray-500 italic">{company.fit_rationale}</p>
+      <p className="text-sm text-gray-600 leading-relaxed">{stripCitations(company.description)}</p>
+      <p className="text-xs text-gray-500 italic">{stripCitations(company.fit_rationale)}</p>
 
       {company.signals?.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {company.signals.map((s, i) => (
-            <span key={i} className="bg-purple-50 text-purple-700 text-xs px-2 py-0.5 rounded-full">{s}</span>
+            <span key={i} className="bg-purple-50 text-purple-700 text-xs px-2 py-0.5 rounded-full">{stripCitations(s)}</span>
           ))}
         </div>
       )}

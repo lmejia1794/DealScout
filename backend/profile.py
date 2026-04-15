@@ -19,7 +19,8 @@ from research import (
     _call_llm,
     _call_json,
     _strip_json_fences,
-    _web_llm_enabled,
+    _escape_control_chars,
+    _google_available,
     WEB_CTX_MAX,
     TODAY,
 )
@@ -43,9 +44,23 @@ def _call_json_object(prompt: str, log_fn=None) -> dict:
         2000,
         log_fn=log_fn,
     )
+    def _parse(s):
+        cleaned = _escape_control_chars(_strip_json_fences(s))
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            try:
+                from json_repair import repair_json
+                repaired = repair_json(cleaned, return_objects=True)
+                if isinstance(repaired, dict):
+                    _log("JSON repaired from truncated output")
+                    return repaired
+            except Exception:
+                pass
+            raise
+
     try:
-        parsed = json.loads(_strip_json_fences(raw))
-        return parsed
+        return _parse(raw)
     except json.JSONDecodeError:
         _log("JSON parse failed on first attempt — retrying with stricter prompt")
         retry_prompt = (
@@ -54,7 +69,7 @@ def _call_json_object(prompt: str, log_fn=None) -> dict:
             "Return ONLY the raw JSON object with absolutely no other text."
         )
         raw2 = _call_llm(retry_prompt, 2000, log_fn=log_fn)
-        return json.loads(_strip_json_fences(raw2))
+        return _parse(raw2)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +186,7 @@ def generate_profile(company: dict, thesis: str, log_fn=None, settings: dict = N
     _log("=== Profile Generation ===")
 
     # Step 1 — Tavily searches
-    if _web_llm_enabled():
+    if _google_available():
         _log("WEB_LLM mode — skipping Tavily searches for profile")
         web_context = ""
     else:
@@ -205,7 +220,7 @@ Growth signals: {', '.join(company.get('signals', []))}"""
 
     web_section = (
         "Use your web search capability to research this company."
-        if _web_llm_enabled()
+        if _google_available()
         else f"Web search results:\n{web_context}"
     )
 
@@ -261,7 +276,7 @@ Do NOT include linkedin_url — omit that field entirely."""
         decision_makers = []
 
     # Step 4 — LinkedIn profile search (Tavily-based, best-effort)
-    if not _web_llm_enabled():
+    if not _google_available():
         _log("Searching for LinkedIn profiles...")
         decision_makers = _enrich_decision_makers(
             company_name=company.get("name", ""),
@@ -270,27 +285,45 @@ Do NOT include linkedin_url — omit that field entirely."""
             log_fn=log_fn,
         )
 
-    # Step 5 — Contact enrichment (email + phone)
+    # Step 5 — Contact enrichment (email + phone) — all DMs in parallel
     _settings = settings or {}
     enrichment_enabled = _settings.get("contact_enrichment_enabled", True)
     if enrichment_enabled:
         from enrichment import enrich_contact
-        _log("=== Contact Enrichment ===")
-        for dm in decision_makers:
-            _log(f"Enriching contact: {dm.get('name', '?')} ({dm.get('title', '')})")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        _log(f"=== Contact Enrichment ({len(decision_makers)} decision makers in parallel) ===")
+
+        def _enrich_one(dm):
+            name = dm.get("name", "?")
+            _log(f"  Enriching: {name} ({dm.get('title', '')})")
             try:
-                contact = enrich_contact(
-                    name=dm.get("name", ""),
+                return dm, enrich_contact(
+                    name=name,
                     title=dm.get("title", ""),
                     company_name=company.get("name", ""),
                     company_website=company.get("website"),
                     company_country=company.get("country"),
                     log_fn=log_fn,
                 )
-                dm["contact"] = contact
             except Exception as e:
-                _log(f"  Enrichment failed for {dm.get('name', '?')}: {e}")
-                dm["contact"] = {"enrichment_notes": f"Enrichment error: {e}"}
+                _log(f"  Enrichment failed for {name}: {e}")
+                return dm, {"enrichment_notes": f"Enrichment error: {e}"}
+
+        contacts: dict = {}
+        with ThreadPoolExecutor(max_workers=len(decision_makers) or 1) as pool:
+            futures = {pool.submit(_enrich_one, dm): dm for dm in decision_makers}
+            for future in as_completed(futures, timeout=40):
+                try:
+                    dm, contact = future.result()
+                    contacts[id(dm)] = (dm, contact)
+                except Exception as e:
+                    dm = futures[future]
+                    _log(f"  Enrichment timed out for {dm.get('name', '?')}: {e}")
+                    contacts[id(dm)] = (dm, {"enrichment_notes": "Enrichment timed out"})
+
+        for dm in decision_makers:
+            _, contact = contacts.get(id(dm), (dm, {"enrichment_notes": "No result"}))
+            dm["contact"] = contact
     else:
         _log("Contact enrichment disabled in settings — skipping")
 
@@ -354,9 +387,16 @@ Return ONLY a raw JSON object:
 
     raw = _call_llm(prompt, 600)
     try:
-        result = json.loads(_strip_json_fences(raw))
+        cleaned = _escape_control_chars(_strip_json_fences(raw))
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError:
+            from json_repair import repair_json
+            result = repair_json(cleaned, return_objects=True)
+            if not isinstance(result, dict):
+                raise ValueError(f"json_repair returned non-dict: {type(result)}")
         return {"subject": result.get("subject", ""), "body": result.get("body", "")}
-    except (json.JSONDecodeError, KeyError):
+    except Exception:
         return {
             "subject": f"Introduction — {company.get('name')}",
             "body": "Sorry, the email draft could not be generated. Please try again.",

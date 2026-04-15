@@ -1,8 +1,35 @@
-import React from 'react'
+import React, { useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import ServiceMap from './ServiceMap'
 import '../report.css'
+
+const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
+
+// ---------------------------------------------------------------------------
+// Citation processing — same logic as SectorBrief.jsx
+// ---------------------------------------------------------------------------
+function processCitations(text) {
+  if (!text) return { processed: '', citations: [] }
+  const citations = []
+  const urlToIndex = {}
+  let refCounter = 0
+  const stripped = text.replace(/[【\[]\s*SRC:[^\]】]*$/, '').trimEnd()
+  const processed = stripped.replace(/[【\[]SRC:\s*([^\]】]+)[】\]]/g, (match, source) => {
+    source = source.trim()
+    if (source.toLowerCase() === 'model_inference' || source.toLowerCase() === 'estimated') return ''
+    if (source.startsWith('http://') || source.startsWith('https://')) {
+      if (!urlToIndex[source]) {
+        refCounter++
+        urlToIndex[source] = refCounter
+        citations.push({ index: refCounter, url: source })
+      }
+      return ` [${urlToIndex[source]}](${source})`
+    }
+    return ''
+  })
+  return { processed, citations }
+}
 
 const COUNTRY_FLAGS = {
   Germany: '🇩🇪', Austria: '🇦🇹', Switzerland: '🇨🇭',
@@ -23,6 +50,13 @@ const MD = {
   ul: ({ children }) => <ul className="list-disc pl-4 my-1.5 space-y-0.5">{children}</ul>,
   ol: ({ children }) => <ol className="list-decimal pl-4 my-1.5 space-y-0.5">{children}</ol>,
   li: ({ children }) => <li className="text-sm text-gray-700 leading-relaxed">{children}</li>,
+  // Render citation superscript links — shows the number, not the full URL
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer"
+      className="text-blue-500 hover:text-blue-700 align-super text-[10px] font-semibold no-underline">
+      {children}
+    </a>
+  ),
 }
 
 function normalize(text) {
@@ -96,7 +130,7 @@ function CompanyBlock({ company, profile, isLast }) {
       {company.signals?.length > 0 && (
         <div className="flex flex-wrap gap-1 mb-4">
           {company.signals.map((s, i) => (
-            <span key={i} className="bg-purple-50 text-purple-700 text-xs px-2 py-0.5 rounded-full">{s}</span>
+            <span key={i} className="bg-purple-50 text-purple-700 text-xs px-2 py-0.5 rounded-full">{stripCitations(s)}</span>
           ))}
         </div>
       )}
@@ -223,12 +257,25 @@ function ComparablesTable({ transactions }) {
 // ---------------------------------------------------------------------------
 // ReportView
 // ---------------------------------------------------------------------------
+const SESSION_KEY = 'dealscout_report'
+
 export default function ReportView() {
   const { state } = useLocation()
   const navigate = useNavigate()
   const today = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
 
-  if (!state) {
+  // Persist report data in sessionStorage so Back navigation doesn't lose it
+  useEffect(() => {
+    if (state) {
+      try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(state)) } catch {}
+    }
+  }, [state])
+
+  const reportData = state || (() => {
+    try { return JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null') } catch { return null }
+  })()
+
+  if (!reportData) {
     return (
       <div className="min-h-screen flex items-center justify-center text-gray-500">
         <div className="text-center">
@@ -246,7 +293,7 @@ export default function ReportView() {
     selectedConferences = [],
     comparables = [],
     profiles = {},
-  } = state
+  } = reportData
 
   return (
     <div className="min-h-screen bg-white">
@@ -281,14 +328,34 @@ export default function ReportView() {
         <hr className="border-gray-200 mb-8" />
 
         {/* Section 1 — Sector Brief */}
-        {sectorBrief && (
-          <div className="mb-8">
-            <h2 className="text-lg font-bold text-gray-800 mb-3 pb-1 border-b border-gray-200">
-              Sector Brief
-            </h2>
-            <ReactMarkdown components={MD}>{normalize(sectorBrief)}</ReactMarkdown>
-          </div>
-        )}
+        {sectorBrief && (() => {
+          const { processed, citations } = processCitations(normalize(sectorBrief))
+          return (
+            <div className="mb-8">
+              <h2 className="text-lg font-bold text-gray-800 mb-3 pb-1 border-b border-gray-200">
+                Sector Brief
+              </h2>
+              <ReactMarkdown components={MD}>{processed}</ReactMarkdown>
+              {citations.length > 0 && (
+                <div className="mt-4 pt-3 border-t border-gray-100">
+                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1.5">Sources</p>
+                  <div className="space-y-1">
+                    {citations.map(({ index, url }) => {
+                      const display = (() => { try { return new URL(url).hostname.replace(/^www\./, '') } catch { return url } })()
+                      return (
+                        <div key={index} className="flex items-start gap-1.5 text-[10px] text-gray-400">
+                          <span className="shrink-0 font-semibold text-gray-400">{index}</span>
+                          <a href={url} target="_blank" rel="noopener noreferrer"
+                            className="text-blue-400 hover:underline truncate">{display}</a>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })()}
 
         {/* Section 2 — Selected Companies */}
         {selectedCompanies.length > 0 && (

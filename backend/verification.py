@@ -3,12 +3,15 @@ verification.py — Post-generation AI evaluation & verification pass for DealSc
 
 Two layers:
   1. Citation extraction: parses [SRC: ...] markers from LLM output (free)
-  2. Tavily re-verification: one search + one LLM call per entity (batch approach)
+  2. AI re-verification: one search + one LLM call per entity (batch approach)
 
 Gated by env flags:
-  VERIFICATION_TAVILY_ENABLED    — set false to skip Tavily (saves credits)
+  VERIFICATION_TAVILY_ENABLED    — set false to skip search verification (saves credits)
   VERIFICATION_CITATIONS_ENABLED — set false to skip citation prompts (free)
-  VERIFICATION_TAVILY_MAX_CALLS  — hard credit cap per run (0 = unlimited, default 20)
+  VERIFICATION_TAVILY_MAX_CALLS  — hard call cap per run (0 = unlimited, default 20)
+  VERIFIER_GOOGLE_MODEL          — Gemini model used for verification (default gemini-2.5-pro).
+                                   Must differ from GOOGLE_MODEL (generator) to avoid
+                                   self-verification bias.
 """
 
 import json
@@ -26,7 +29,65 @@ CITATIONS_ENABLED = os.getenv("VERIFICATION_CITATIONS_ENABLED", "true").lower() 
 TAVILY_MAX_CALLS = int(os.getenv("VERIFICATION_TAVILY_MAX_CALLS", "20"))
 CITATION_FETCH_MAX_CHARS = int(os.getenv("CITATION_FETCH_MAX_CHARS", "3000"))
 
+# Verifier model — intentionally a DIFFERENT PROVIDER from the generator.
+# When Gemini generates, OpenRouter verifies (cross-provider = strongest independence).
+# When OpenRouter generates, Gemini verifies (VERIFIER_GOOGLE_MODEL, if key is set).
+VERIFIER_OPENROUTER_MODEL = os.getenv("VERIFIER_OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+VERIFIER_GOOGLE_MODEL = os.getenv("VERIFIER_GOOGLE_MODEL", "gemini-3-flash-preview")
+
 CITATION_RE = re.compile(r'\[SRC:\s*([^\]]+)\]')
+
+
+# ---------------------------------------------------------------------------
+# Verifier LLM — opposite provider from the generator
+# ---------------------------------------------------------------------------
+
+def _call_verifier_llm(prompt: str, max_tokens: int, use_search: bool = False) -> str:
+    """
+    Fact-checker LLM — always a different provider from the data generator.
+
+    When Gemini is the generator (GOOGLE_API_KEY set):
+      → verifier uses OpenRouter (VERIFIER_OPENROUTER_MODEL, free Llama by default).
+        Cross-provider independence: Llama cannot verify its own Gemini-generated output.
+        Note: use_search is passed but free OpenRouter models may ignore it gracefully.
+      → Degrades to same-provider Gemini only if OpenRouter is unavailable.
+
+    When OpenRouter is the generator (no GOOGLE_API_KEY):
+      → verifier uses Gemini (VERIFIER_GOOGLE_MODEL) with native search grounding.
+      → Falls back to OpenRouter if Gemini is unavailable.
+    """
+    from research import _call_google, _call_openrouter, _google_available
+
+    if _google_available():
+        # Generator is Gemini → use OpenRouter for cross-provider verification
+        try:
+            return _call_openrouter(VERIFIER_OPENROUTER_MODEL, prompt, max_tokens, use_web_search=use_search)
+        except Exception as e:
+            logger.warning(
+                "Verifier OpenRouter (%s) unavailable: %s — degrading to same-provider Gemini verification",
+                VERIFIER_OPENROUTER_MODEL, e,
+            )
+            # Graceful degrade: same provider but still an independent prompt evaluation
+            generator_model = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+            return _call_google(prompt, max_tokens, use_search=use_search, settings={"google_model": generator_model})
+    else:
+        # Generator is OpenRouter → use Gemini for cross-provider verification
+        try:
+            return _call_google(
+                prompt, max_tokens,
+                use_search=use_search,
+                settings={"google_model": VERIFIER_GOOGLE_MODEL},
+            )
+        except Exception as e:
+            logger.warning("Verifier Gemini (%s) failed: %s — falling back to OpenRouter", VERIFIER_GOOGLE_MODEL, e)
+            return _call_openrouter(VERIFIER_OPENROUTER_MODEL, prompt, max_tokens, use_web_search=use_search)
+
+
+def _verifier_uses_gemini_search() -> bool:
+    """True when the verifier will call Gemini with native search grounding."""
+    from research import _google_available
+    # Gemini search is only used when OpenRouter is the generator (so Gemini is the verifier)
+    return not _google_available()
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -90,10 +151,11 @@ def _extract_citations(text: str):
 
 
 def _clean_entity_fields(entity: dict) -> dict:
-    """Strip all [SRC: ...] markers from entity string field values for clean display."""
+    """Strip [SRC: ...] markers from entity string field values and drop internal _ keys."""
     return {
         k: CITATION_RE.sub('', str(v)).strip() if isinstance(v, str) else v
         for k, v in entity.items()
+        if not k.startswith('_')  # drop internal metadata keys like _grounding_url
     }
 
 
@@ -132,12 +194,12 @@ def _validate_citation_url(url: str) -> bool:
 # Website discovery (Tavily search when URL is missing)
 # ---------------------------------------------------------------------------
 
-def _find_website(name: str, location: str = "", log_fn=None, is_conference: bool = False) -> Optional[str]:
+def _find_website(name: str, location: str = "", log_fn=None, is_conference: bool = False, search_provider: str = "duckduckgo") -> Optional[str]:
     """
     Search for the official website of a company or conference when none is known.
     Returns the first plausible homepage URL or None.
     """
-    from search import _run_search, _get_client
+    from search import run_search
 
     def _log(msg):
         logger.debug(msg)
@@ -145,12 +207,11 @@ def _find_website(name: str, location: str = "", log_fn=None, is_conference: boo
             log_fn(msg)
 
     try:
-        client = _get_client()
         if is_conference:
             query = f'"{name}" conference official website'
         else:
             query = f'"{name}" {location} official website homepage'.strip()
-        results = _run_search(client, query)
+        results = run_search(query, provider=search_provider)
         for r in results:
             url = r.get('url', '')
             # Accept the first result that looks like a homepage (short path, right domain)
@@ -264,14 +325,83 @@ def _fetch_and_verify_citation(
     Fetch the cited URL, extract readable text, ask a second LLM call to
     confirm whether the claim is actually supported by the page content.
     Returns a Verification-compatible dict with citation_url and source_url set.
+
+    When the URL is unreachable (404, redirect-to-homepage, HTTP error) and
+    Gemini is the verifier, falls back to a targeted site: search on the domain
+    before marking the claim unverifiable.
     """
-    from research import _call_llm, _strip_json_fences
+    from research import _strip_json_fences
     from bs4 import BeautifulSoup
+    from urllib.parse import urlparse as _urlparse
 
     def _log(msg):
         logger.debug(msg)
         if log_fn:
             log_fn(msg)
+
+    def _site_search_fallback(reason: str) -> dict:
+        """
+        When a cited URL is broken, try site:domain search via Gemini to find
+        the content at a different path. Only runs when Gemini is the verifier.
+        """
+        if not _verifier_uses_gemini_search():
+            return {
+                'status': 'unverifiable',
+                'citation_url': url,
+                'source_url': url,
+                'citation_note': reason,
+                'claim': claim,
+            }
+        try:
+            domain = _urlparse(url).netloc or url
+            _log(f"  {reason} — trying site:{domain} search for claim")
+            prompt = f"""A citation URL returned an error ({reason}), but the domain may still host the content at a different path.
+
+Claim to verify: "{claim}"
+About: {entity_name}
+Original URL (broken): {url}
+Domain: {domain}
+
+Search site:{domain} to find whether this claim is supported anywhere on that site.
+
+Return ONLY a JSON object:
+{{
+  "verdict": "verified" | "contradicted" | "unverifiable",
+  "source_url": "URL where the content was found, or null",
+  "supporting_excerpt": "brief quote supporting your verdict, or null"
+}}"""
+            raw = _call_verifier_llm(prompt, max_tokens=300, use_search=True)
+            from research import _strip_json_fences as _sfences
+            _cleaned = _sfences(raw)
+            try:
+                parsed = json.loads(_cleaned)
+            except json.JSONDecodeError:
+                from json_repair import repair_json
+                parsed = repair_json(_cleaned, return_objects=True)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"json_repair returned non-dict for site search: {type(parsed)}")
+            verdict = parsed.get('verdict', 'unverifiable')
+            if verdict not in ('verified', 'contradicted', 'unverifiable'):
+                verdict = 'unverifiable'
+            found_url = parsed.get('source_url')
+            _log(f"  Site search result: {verdict}" + (f" — {found_url}" if found_url else ""))
+            return {
+                'status': verdict,
+                'citation_url': url,
+                'source_url': found_url or url,
+                'source_snippet': parsed.get('supporting_excerpt'),
+                'citation_note': f'Original URL broken ({reason}); verified via site search' if verdict != 'unverifiable' else reason,
+                'claim': claim,
+            }
+        except Exception as e:
+            _log(f"  Site search fallback failed: {e}")
+            return {
+                'status': 'unverifiable',
+                'citation_url': url,
+                'source_url': url,
+                'citation_note': reason,
+                'claim': claim,
+            }
 
     # Sub-step A: fetch page
     try:
@@ -280,26 +410,13 @@ def _fetch_and_verify_citation(
         final_url = str(resp.url)
         if resp.status_code == 404:
             _log(f"  Citation URL 404: {url}")
-            return {
-                'status': 'unverifiable',
-                'citation_url': url,
-                'source_url': url,
-                'citation_note': 'Cited URL returned 404 — likely hallucinated URL',
-                'claim': claim,
-            }
+            return _site_search_fallback('Cited URL returned 404')
         if resp.status_code >= 400:
-            return {
-                'status': 'unverifiable',
-                'citation_url': url,
-                'source_url': url,
-                'citation_note': f'Could not fetch cited URL: HTTP {resp.status_code}',
-                'claim': claim,
-            }
+            return _site_search_fallback(f'Could not fetch cited URL: HTTP {resp.status_code}')
 
         # Detect homepage-redirect: original URL had a specific path but resolved
         # to the root — the specific page doesn't exist (hallucinated URL pattern)
         try:
-            from urllib.parse import urlparse as _urlparse
             orig = _urlparse(url)
             final = _urlparse(final_url)
             orig_path = orig.path.rstrip('/')
@@ -311,13 +428,7 @@ def _fetch_and_verify_citation(
                     and (final_path in ('', '/') or final_path == orig_path[:3])
                     and orig_domain == final_domain):
                 _log(f"  Citation URL redirects to homepage — likely hallucinated: {url} → {final_url}")
-                return {
-                    'status': 'unverifiable',
-                    'citation_url': url,
-                    'source_url': final_url,
-                    'citation_note': 'Cited URL redirects to homepage — specific page does not exist (likely hallucinated URL)',
-                    'claim': claim,
-                }
+                return _site_search_fallback('Cited URL redirects to homepage — specific page does not exist')
         except Exception:
             pass
 
@@ -365,7 +476,7 @@ def _fetch_and_verify_citation(
             'claim': claim,
         }
 
-    # Sub-step C: secondary LLM verification call
+    # Sub-step C: secondary LLM verification call (verifier model — not the generator)
     try:
         prompt = f"""You are a fact-checker reading a web page to verify a specific claim.
 
@@ -384,8 +495,15 @@ Return ONLY a JSON object:
   "corrected_value": "if contradicted, the correct value from the page, or null"
 }}"""
 
-        raw = _call_llm(prompt, max_tokens=300)
-        parsed = json.loads(_strip_json_fences(raw))
+        raw = _call_verifier_llm(prompt, max_tokens=300)
+        _cleaned = _strip_json_fences(raw)
+        try:
+            parsed = json.loads(_cleaned)
+        except json.JSONDecodeError:
+            from json_repair import repair_json
+            parsed = repair_json(_cleaned, return_objects=True)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"json_repair returned non-dict for citation verify: {type(parsed)}")
         verdict = parsed.get('verdict', 'unverifiable')
         if verdict not in ('verified', 'contradicted', 'unverifiable'):
             verdict = 'unverifiable'
@@ -420,6 +538,7 @@ def _verify_field_with_citations(
     use_tavily: Optional[bool] = None,
     existing_context: str = "",
     call_state: Optional[dict] = None,
+    search_provider: str = "duckduckgo",
 ) -> dict:
     """
     Citation-first priority logic:
@@ -438,17 +557,18 @@ def _verify_field_with_citations(
         _log(f"  {field_name}: {citation_type} → inferred immediately")
         return {'status': 'inferred', 'claim': claim, 'citation_note': citation_type}
 
-    budget_ok = (
-        enabled and (
-            call_state is None
-            or TAVILY_MAX_CALLS == 0
-            or call_state.get('count', 0) < TAVILY_MAX_CALLS
-        )
+    # DuckDuckGo is free — no cap. Cap only applies to Tavily.
+    under_cap = (
+        search_provider != 'tavily'
+        or TAVILY_MAX_CALLS == 0
+        or call_state is None
+        or call_state.get('count', 0) < TAVILY_MAX_CALLS
     )
+    budget_ok = enabled and under_cap
 
     if citation_type == 'training_knowledge':
         if budget_ok:
-            _log(f"  {field_name}: training_knowledge → Tavily fallback")
+            _log(f"  {field_name}: training_knowledge → search fallback")
             batch = _verify_entity_batch(
                 entity_name=entity_name,
                 search_query=f'"{entity_name}" {claim[:60]}',
@@ -457,6 +577,7 @@ def _verify_field_with_citations(
                 use_tavily=True,
                 existing_context=existing_context,
                 call_state=call_state,
+                search_provider=search_provider,
             )
             return batch.get(field_name, {'status': 'unverifiable', 'claim': claim})
         return {
@@ -468,7 +589,7 @@ def _verify_field_with_citations(
     if citation_type == 'url' and citation_url:
         result = _fetch_and_verify_citation(citation_url, claim, entity_name, log_fn=log_fn)
         if result.get('status') == 'unverifiable' and budget_ok:
-            _log(f"  {field_name}: citation fetch failed → Tavily fallback")
+            _log(f"  {field_name}: citation fetch failed → search fallback")
             batch = _verify_entity_batch(
                 entity_name=entity_name,
                 search_query=f'"{entity_name}" {claim[:60]}',
@@ -477,6 +598,7 @@ def _verify_field_with_citations(
                 use_tavily=True,
                 existing_context=existing_context,
                 call_state=call_state,
+                search_provider=search_provider,
             )
             return batch.get(field_name, result)
         return result
@@ -496,13 +618,18 @@ def _verify_entity_batch(
     use_tavily: Optional[bool] = None,
     existing_context: str = "",
     call_state: Optional[dict] = None,  # {"count": int} — shared mutable counter
+    search_provider: str = "duckduckgo",
+    grounding_url: str = None,          # Gemini grounding URL for this entity (replaces search)
 ) -> dict:
     """
-    One Tavily search (or reuse existing context) + one LLM call for all claims.
+    Verify all claims for one entity using the verifier model (not the generator).
+    - Path A: existing_context cache hit → verifier LLM only (free)
+    - Path B: Gemini available → verifier with native search (no Tavily/DDG)
+    - Path C: no Gemini → run_search + verifier LLM (Tavily/DuckDuckGo fallback)
     Returns {field_name: Verification-compatible dict}.
     """
-    from search import _run_search, _get_client
-    from research import _call_llm, _strip_json_fences
+    from search import run_search
+    from research import _strip_json_fences
 
     def _log(msg):
         logger.debug(msg)
@@ -514,41 +641,43 @@ def _verify_entity_batch(
     if not enabled:
         return {k: {'status': 'pending', 'claim': v} for k, v in claims.items()}
 
-    # Check call cap
-    if call_state is not None and TAVILY_MAX_CALLS > 0:
+    # Check call cap — only applies to Tavily (paid); DuckDuckGo is free, no cap needed
+    if search_provider == 'tavily' and call_state is not None and TAVILY_MAX_CALLS > 0:
         if call_state.get('count', 0) >= TAVILY_MAX_CALLS:
             _log(f"  Tavily cap reached ({TAVILY_MAX_CALLS}) — skipping {entity_name}")
             return {k: {'status': 'pending', 'citation_note': 'Tavily call limit reached for this run', 'claim': v} for k, v in claims.items()}
 
-    # Reuse existing context if it covers this entity (free — no Tavily call)
+    claims_json = json.dumps(claims, indent=2)
     tavily_context = ""
     used_cache = False
-    if existing_context and entity_name.lower() in existing_context.lower():
-        # Entity appeared in initial research context — use it directly
+
+    # --- Path A0: use Gemini grounding URL fetched during generation (free — no new search) ---
+    if grounding_url:
+        try:
+            _log(f"  Using grounding URL for {entity_name}: {grounding_url[:80]}")
+            r = httpx.get(grounding_url, timeout=8, follow_redirects=True,
+                          headers={"User-Agent": _BROWSER_UA})
+            if r.status_code < 400:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(r.text, 'html.parser')
+                for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
+                    tag.decompose()
+                page_text = ' '.join(soup.get_text(separator=' ').split())[:3000]
+                if page_text:
+                    tavily_context = page_text
+                    used_cache = True
+                    _log(f"  Grounding URL fetched ({len(page_text)} chars) — using as verification context")
+        except Exception as e:
+            _log(f"  Grounding URL fetch failed: {e} — falling through to search")
+
+    # --- Path A: reuse existing context (free — no search call) ---
+    if not used_cache and existing_context and entity_name.lower() in existing_context.lower():
         tavily_context = existing_context[:3000]
         used_cache = True
         _log(f"  Using cached research context for {entity_name}")
-    else:
-        # Fresh Tavily search
-        try:
-            client = _get_client()
-            results = _run_search(client, search_query)
-            if call_state is not None:
-                call_state['count'] = call_state.get('count', 0) + 1
-            if results:
-                ctx_parts = [f"URL: {r.get('url', '')}\n{r.get('content', '')[:400]}" for r in results[:5]]
-                tavily_context = "\n\n".join(ctx_parts)
-            _log(f"  Tavily search #{call_state.get('count', '?') if call_state else '?'}: {search_query}")
-        except Exception as e:
-            _log(f"  Tavily search failed: {e}")
-            return {k: {'status': 'unverifiable', 'checked_query': search_query} for k in claims}
 
-    if not tavily_context:
-        return {k: {'status': 'unverifiable', 'checked_query': search_query} for k in claims}
-
-    # One LLM call for all claims
-    try:
-        claims_json = json.dumps(claims, indent=2)
+    # Paths A0 + A share the same context-based prompt
+    if used_cache:
         prompt = f"""You are a fact-checker. Given these web search results about {entity_name}, assess each claim below as "verified", "contradicted", or "unverifiable".
 
 Search results:
@@ -559,24 +688,117 @@ Claims to assess:
 
 Return ONLY a JSON object where each key matches a claim key and the value is:
 {{
-  "verdict": "verified" | "contradicted" | "unverifiable",
+  "verdict": "verified" | "contradicted" | "inferred" | "unverifiable",
   "source_url": "most relevant URL or null",
   "snippet": "brief supporting excerpt or null",
   "corrected_value": "the correct scalar value from sources if contradicted (e.g. '2008', 'Acquired by SAP in 2021', 'October 14-16, 2026'), or null if not contradicted"
 }}
 
-verdict must be exactly one of: "verified", "contradicted", "unverifiable".
+verdict must be exactly one of: "verified", "contradicted", "inferred", "unverifiable".
+Use "inferred" when the claim is plausible and consistent with available context but cannot be pinpointed to a specific source — e.g. a company's approximate founding year or employee range that seems right but isn't confirmed by a direct citation.
+Use "unverifiable" only when the claim is about a very specific fact that directly contradicts available evidence or is clearly implausible.
 corrected_value should be short and direct — it will be displayed inline as a replacement."""
+        try:
+            raw = _call_verifier_llm(prompt, max_tokens=400, use_search=False)
+        except Exception as e:
+            _log(f"  Verifier LLM (context path) failed: {e}")
+            return {k: {'status': 'unverifiable', 'checked_query': None} for k in claims}
 
-        raw = _call_llm(prompt, max_tokens=400)
+    # --- Path B: Gemini native search (only when Gemini is the verifier) ---
+    elif _verifier_uses_gemini_search():
+        if call_state is not None:
+            call_state['count'] = call_state.get('count', 0) + 1
+        _log(f"  Verifier search #{call_state.get('count', '?') if call_state else '?'} (Gemini native): {search_query}")
+        prompt = f"""You are a fact-checker. Use web search to find information about {entity_name} and verify the following claims.
+
+Search for: {search_query}
+
+Claims to assess:
+{claims_json}
+
+For each claim, search for relevant information, then assess as "verified", "contradicted", or "unverifiable".
+
+Return ONLY a JSON object where each key matches a claim key and the value is:
+{{
+  "verdict": "verified" | "contradicted" | "inferred" | "unverifiable",
+  "source_url": "most relevant URL or null",
+  "snippet": "brief supporting excerpt or null",
+  "corrected_value": "the correct scalar value from sources if contradicted (e.g. '2008', 'Acquired by SAP in 2021', 'October 14-16, 2026'), or null if not contradicted"
+}}
+
+verdict must be exactly one of: "verified", "contradicted", "inferred", "unverifiable".
+Use "inferred" when the claim is plausible and consistent with available context but cannot be pinpointed to a specific source — e.g. a company's approximate founding year or employee range that seems right but isn't confirmed by a direct citation.
+Use "unverifiable" only when the claim is about a very specific fact that directly contradicts available evidence or is clearly implausible.
+corrected_value should be short and direct — it will be displayed inline as a replacement."""
+        try:
+            raw = _call_verifier_llm(prompt, max_tokens=400, use_search=True)
+        except Exception as e:
+            _log(f"  Verifier LLM (Gemini search) failed: {e}")
+            return {k: {'status': 'unverifiable', 'checked_query': search_query} for k in claims}
+
+    # --- Path C: fallback — run_search + verifier LLM (no Gemini available) ---
+    else:
+        try:
+            results = run_search(search_query, provider=search_provider)
+            # Only track call count for Tavily (paid); DuckDuckGo is free
+            if search_provider == 'tavily' and call_state is not None:
+                call_state['count'] = call_state.get('count', 0) + 1
+            if results:
+                ctx_parts = [f"URL: {r.get('url', '')}\n{r.get('content', '')[:400]}" for r in results[:5]]
+                tavily_context = "\n\n".join(ctx_parts)
+            else:
+                tavily_context = ""
+            count_str = f" #{call_state['count']}" if search_provider == 'tavily' and call_state else ""
+            _log(f"  {search_provider} search{count_str}: {search_query}")
+        except Exception as e:
+            _log(f"  Search failed: {e}")
+            return {k: {'status': 'unverifiable', 'checked_query': search_query} for k in claims}
+
+        if not tavily_context:
+            return {k: {'status': 'unverifiable', 'checked_query': search_query} for k in claims}
+
+        prompt = f"""You are a fact-checker. Given these web search results about {entity_name}, assess each claim below as "verified", "contradicted", or "unverifiable".
+
+Search results:
+{tavily_context}
+
+Claims to assess:
+{claims_json}
+
+Return ONLY a JSON object where each key matches a claim key and the value is:
+{{
+  "verdict": "verified" | "contradicted" | "inferred" | "unverifiable",
+  "source_url": "most relevant URL or null",
+  "snippet": "brief supporting excerpt or null",
+  "corrected_value": "the correct scalar value from sources if contradicted (e.g. '2008', 'Acquired by SAP in 2021', 'October 14-16, 2026'), or null if not contradicted"
+}}
+
+verdict must be exactly one of: "verified", "contradicted", "inferred", "unverifiable".
+Use "inferred" when the claim is plausible and consistent with available context but cannot be pinpointed to a specific source — e.g. a company's approximate founding year or employee range that seems right but isn't confirmed by a direct citation.
+Use "unverifiable" only when the claim is about a very specific fact that directly contradicts available evidence or is clearly implausible.
+corrected_value should be short and direct — it will be displayed inline as a replacement."""
+        try:
+            raw = _call_verifier_llm(prompt, max_tokens=400, use_search=False)
+        except Exception as e:
+            _log(f"  Verifier LLM (search fallback) failed: {e}")
+            return {k: {'status': 'unverifiable', 'checked_query': search_query, 'claim': v} for k, v in claims.items()}
+
+    # Parse verifier output (all paths converge here)
+    try:
         raw = _strip_json_fences(raw)
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            from json_repair import repair_json
+            parsed = repair_json(raw, return_objects=True)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"json_repair returned non-dict for batch verify: {type(parsed)}")
 
         results_out = {}
         for field, claim_text in claims.items():
             field_result = parsed.get(field, {})
             verdict = field_result.get('verdict', 'unverifiable')
-            if verdict not in ('verified', 'contradicted', 'unverifiable'):
+            if verdict not in ('verified', 'contradicted', 'inferred', 'unverifiable'):
                 verdict = 'unverifiable'
             corrected = field_result.get('corrected_value') if verdict == 'contradicted' else None
             results_out[field] = {
@@ -603,6 +825,7 @@ def verify_company(
     use_tavily: Optional[bool] = None,
     existing_context: str = "",
     call_state: Optional[dict] = None,
+    search_provider: str = "duckduckgo",
 ) -> dict:
     """
     Verify 3 high-stakes fields + website liveness check.
@@ -626,7 +849,7 @@ def verify_company(
         snippet = wv.get('source_snippet') or wv.get('citation_note', '')
         _log(f"    website: {wv['status']} — {snippet[:80]}")
     else:
-        found_url = _find_website(name, country, log_fn=log_fn)
+        found_url = _find_website(name, country, log_fn=log_fn, search_provider=search_provider)
         if found_url:
             company['website'] = found_url
             verifications['website'] = {'status': 'verified', 'source_url': found_url,
@@ -667,7 +890,7 @@ def verify_company(
         if ctype == 'url' and curl:
             _log(f"    ownership: citation URL found → fetching {curl}")
             verifications['ownership'] = _verify_field_with_citations(
-                'ownership', claim, curl, ctype, name, log_fn, use_tavily, existing_context, call_state)
+                'ownership', claim, curl, ctype, name, log_fn, use_tavily, existing_context, call_state, search_provider)
             icon = '✓' if verifications['ownership'].get('status') == 'verified' else '~'
             _log(f"    ownership: {verifications['ownership'].get('status')} {icon}")
         else:
@@ -681,7 +904,7 @@ def verify_company(
         if ctype == 'url' and curl:
             _log(f"    founded: citation URL found → fetching {curl}")
             verifications['founded'] = _verify_field_with_citations(
-                'founded', claim, curl, ctype, name, log_fn, use_tavily, existing_context, call_state)
+                'founded', claim, curl, ctype, name, log_fn, use_tavily, existing_context, call_state, search_provider)
             icon = '✓' if verifications['founded'].get('status') == 'verified' else '~'
             _log(f"    founded: {verifications['founded'].get('status')} {icon}")
         else:
@@ -690,7 +913,9 @@ def verify_company(
     # Clean company for output — strip all [SRC: ...] markers AFTER citation extraction
     company = _clean_entity_fields(company)
 
-    # Batch remaining fields via Tavily (existence always here, others if no citation URL)
+    # Batch remaining fields
+    # Use the grounding URL from generation (Gemini grounding source) if available
+    entity_grounding_url = company.get('_grounding_url')
     if batch_claims:
         search_query = f'"{name}" {country} software company'
         batch = _verify_entity_batch(
@@ -701,6 +926,8 @@ def verify_company(
             use_tavily=use_tavily,
             existing_context=existing_context,
             call_state=call_state,
+            search_provider=search_provider,
+            grounding_url=entity_grounding_url,
         )
         for field, v in batch.items():
             verifications[field] = v
@@ -726,6 +953,7 @@ def verify_conference(
     use_tavily: Optional[bool] = None,
     existing_context: str = "",
     call_state: Optional[dict] = None,
+    search_provider: str = "duckduckgo",
 ) -> dict:
     """
     Verify 2 high-stakes fields (date+location, existence).
@@ -757,7 +985,7 @@ def verify_conference(
 
     # Website: if missing, search for the conference homepage
     if not conference.get('website'):
-        found_url = _find_website(name, clean_location or '', log_fn=log_fn, is_conference=True)
+        found_url = _find_website(name, clean_location or '', log_fn=log_fn, is_conference=True, search_provider=search_provider)
         if found_url:
             conference['website'] = found_url
             _log(f"    website: found via search → {found_url}")
@@ -781,7 +1009,7 @@ def verify_conference(
             _log(f"    date_location: citation URL found → fetching {dl_citation_url}")
             verifications['date_location'] = _verify_field_with_citations(
                 'date_location', dl_claim, dl_citation_url, dl_citation_type,
-                name, log_fn, use_tavily, existing_context, call_state)
+                name, log_fn, use_tavily, existing_context, call_state, search_provider)
             icon = '✓' if verifications['date_location'].get('status') == 'verified' else '~'
             _log(f"    date_location: {verifications['date_location'].get('status')} {icon}")
         else:
@@ -789,6 +1017,9 @@ def verify_conference(
 
     # existence: always Tavily batch
     batch_claims['existence'] = f'{name} is a real conference happening in {year or "2026"}'
+
+    # Use the grounding URL from generation if available
+    entity_grounding_url = conference.get('_grounding_url')
 
     # Clean conference for output AFTER citation extraction
     conference = _clean_entity_fields(conference)
@@ -803,6 +1034,8 @@ def verify_conference(
             use_tavily=use_tavily,
             existing_context=existing_context,
             call_state=call_state,
+            search_provider=search_provider,
+            grounding_url=entity_grounding_url,
         )
         for field, v in batch.items():
             verifications[field] = v
@@ -834,6 +1067,7 @@ def verify_sector_brief(
     log_fn=None,
     use_tavily: Optional[bool] = None,
     call_state: Optional[dict] = None,
+    search_provider: str = "duckduckgo",
 ) -> dict:
     """
     Citation-first verification for the sector brief.
@@ -842,9 +1076,9 @@ def verify_sector_brief(
       1. URL citations → fetch page, secondary LLM call to confirm claim (free of Tavily)
       2. estimated / derived → mark inferred immediately
       3. training_knowledge → mark unverifiable (too many in a sector brief to burn Tavily budget)
-      4. No URL citations found → fall back to numeric claim extraction + Tavily batch
+      4. No URL citations found → use Gemini web search (if available) or Tavily batch
     """
-    from research import _call_llm, _strip_json_fences
+    from research import _strip_json_fences, _escape_control_chars
 
     def _log(msg):
         logger.info(msg)
@@ -889,47 +1123,99 @@ def verify_sector_brief(
                 })
 
     else:
-        # --- Fallback: no URL citations → extract numeric claims + Tavily batch ---
-        _log("> No URL citations — falling back to numeric claim extraction + Tavily")
+        # --- Fallback: no URL citations ---
+        if _verifier_uses_gemini_search():
+            # Gemini has native search — use it to verify claims directly (no Tavily)
+            _log("> No URL citations — using Gemini web search to verify claims")
+            verify_prompt = f"""You are a fact-checker for a private equity research brief.
+Use web search to verify the 3 most specific numeric claims (market size, growth rates, percentages).
 
-        extract_prompt = f"""Extract the 3 most specific, verifiable numeric claims from this sector brief.
+Sector brief (excerpt):
+{sector_brief[:3000]}
+
+For each claim:
+1. Search for it
+2. Determine: verified (corroborated by a source), contradicted (source says differently), or unverifiable (cannot find)
+3. Provide the source URL if verified
+
+Return ONLY a raw JSON array of up to 3 objects:
+[{{"claim": "...", "status": "verified|unverifiable|contradicted", "source_url": "https://...|null", "note": "1 sentence"}}]"""
+            try:
+                raw = _call_verifier_llm(verify_prompt, 800, use_search=True)
+                _cleaned = _escape_control_chars(_strip_json_fences(raw))
+                try:
+                    results = json.loads(_cleaned)
+                except json.JSONDecodeError:
+                    from json_repair import repair_json
+                    results = repair_json(_cleaned, return_objects=True)
+                if not isinstance(results, list):
+                    results = []
+                for r in results:
+                    if not isinstance(r, dict):
+                        continue
+                    status = r.get('status', 'unverifiable')
+                    icon = '✓' if status == 'verified' else ('✗' if status == 'contradicted' else '?')
+                    _log(f">   {r.get('claim', '')[:60]}... → {status} {icon}")
+                    if r.get('source_url'):
+                        _log(f">   Source: {r['source_url']}")
+                    verified_claims.append({
+                        'claim': r.get('claim', ''),
+                        'verification': {
+                            'status': status,
+                            'claim': r.get('claim', ''),
+                            'source_url': r.get('source_url'),
+                            'note': r.get('note', ''),
+                        }
+                    })
+            except Exception as e:
+                _log(f"  Gemini verification failed: {e}")
+        else:
+            # --- Tavily fallback (non-Google path only) ---
+            _log("> No URL citations — falling back to numeric claim extraction + Tavily")
+
+            extract_prompt = f"""Extract the 3 most specific, verifiable numeric claims from this sector brief.
 Focus on: market size figures, growth rates, percentages — NOT qualitative statements.
 Return ONLY a JSON object with keys "claim_1", "claim_2", "claim_3" (use null if fewer than 3 exist).
 
 Sector brief:
 {sector_brief}"""
 
-        try:
-            raw = _call_llm(extract_prompt, max_tokens=200)
-            raw = _strip_json_fences(raw)
-            extracted = json.loads(raw)
-            if not isinstance(extracted, dict):
-                extracted = {}
-            claims = {k: v for k, v in extracted.items() if isinstance(v, str) and v.strip()}
-        except Exception as e:
-            _log(f"  Claim extraction failed: {e}")
-            return {'claims': [], 'overall_confidence': None}
+            try:
+                raw = _call_verifier_llm(extract_prompt, max_tokens=200)
+                _cleaned = _escape_control_chars(_strip_json_fences(raw))
+                try:
+                    extracted = json.loads(_cleaned)
+                except json.JSONDecodeError:
+                    from json_repair import repair_json
+                    extracted = repair_json(_cleaned, return_objects=True)
+                if not isinstance(extracted, dict):
+                    extracted = {}
+                claims = {k: v for k, v in extracted.items() if isinstance(v, str) and v.strip()}
+            except Exception as e:
+                _log(f"  Claim extraction failed: {e}")
+                return {'claims': [], 'overall_confidence': None}
 
-        if not claims:
-            _log("> No numeric claims extracted — skipping verification")
-            return {'claims': [], 'overall_confidence': None}
+            if not claims:
+                _log("> No numeric claims extracted — skipping verification")
+                return {'claims': [], 'overall_confidence': None}
 
-        _log(f"> Extracted {len(claims)} numeric claims — verifying in 1 Tavily batch call")
+            _log(f"> Extracted {len(claims)} numeric claims — verifying in 1 Tavily batch call")
 
-        batch = _verify_entity_batch(
-            entity_name="this sector",
-            search_query=f"sector market size growth rate {list(claims.values())[0][:50]}",
-            claims=claims,
-            log_fn=log_fn,
-            use_tavily=use_tavily,
-            call_state=call_state,
-        )
+            batch = _verify_entity_batch(
+                entity_name="this sector",
+                search_query=f"sector market size growth rate {list(claims.values())[0][:50]}",
+                claims=claims,
+                log_fn=log_fn,
+                use_tavily=use_tavily,
+                call_state=call_state,
+                search_provider=search_provider,
+            )
 
-        for key, claim_text in claims.items():
-            v = batch.get(key, {'status': 'unverifiable'})
-            icon = '✓' if v['status'] == 'verified' else ('✗' if v['status'] == 'contradicted' else '?')
-            _log(f'> {key}: "{claim_text[:60]}..." → {v["status"]} {icon}')
-            verified_claims.append({'claim': claim_text, 'verification': v})
+            for key, claim_text in claims.items():
+                v = batch.get(key, {'status': 'unverifiable'})
+                icon = '✓' if v['status'] == 'verified' else ('✗' if v['status'] == 'contradicted' else '?')
+                _log(f'> {key}: "{claim_text[:60]}..." → {v["status"]} {icon}')
+                verified_claims.append({'claim': claim_text, 'verification': v})
 
     if not verified_claims:
         return {'claims': [], 'overall_confidence': None}
@@ -949,6 +1235,7 @@ def verify_field(
     context: str = "",
     use_tavily: Optional[bool] = None,
     log_fn=None,
+    search_provider: str = "duckduckgo",
 ) -> dict:
     """
     On-demand verification of a single field. Used by the /api/verify/field endpoint.
@@ -959,7 +1246,7 @@ def verify_field(
     2. If Gemini-only returns verified/contradicted: return immediately.
     3. Otherwise: fall back to _verify_entity_batch with Tavily.
     """
-    from research import _call_llm, _strip_json_fences
+    from research import _strip_json_fences
 
     def _log(msg):
         logger.info(msg)
@@ -968,7 +1255,7 @@ def verify_field(
 
     enabled = TAVILY_ENABLED if use_tavily is None else use_tavily
 
-    # Step 1: Try context-only (free)
+    # Step 1: Try context-only with verifier model (free — no search call)
     if context and context.strip():
         try:
             prompt = f"""You are a fact-checker. Given these search results, assess whether this claim is supported, contradicted, or cannot be determined.
@@ -980,14 +1267,23 @@ Search results:
 
 Return ONLY a JSON object:
 {{
-  "verdict": "verified" | "contradicted" | "unverifiable",
+  "verdict": "verified" | "contradicted" | "inferred" | "unverifiable",
   "source_url": "most relevant URL or null",
   "snippet": "brief supporting excerpt or null"
-}}"""
-            raw = _call_llm(prompt, max_tokens=200)
-            parsed = json.loads(_strip_json_fences(raw))
+}}
+
+Use "inferred" when the claim is plausible and consistent with the context but not directly cited."""
+            raw = _call_verifier_llm(prompt, max_tokens=200)
+            _cleaned = _strip_json_fences(raw)
+            try:
+                parsed = json.loads(_cleaned)
+            except json.JSONDecodeError:
+                from json_repair import repair_json
+                parsed = repair_json(_cleaned, return_objects=True)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"json_repair returned non-dict for verify_field: {type(parsed)}")
             verdict = parsed.get('verdict', 'unverifiable')
-            if verdict in ('verified', 'contradicted'):
+            if verdict in ('verified', 'contradicted', 'inferred'):
                 _log(f"  verify_field: context-only result = {verdict} (no Tavily used)")
                 corrected = parsed.get('corrected_value') if verdict == 'contradicted' else None
                 return {
@@ -1012,6 +1308,7 @@ Return ONLY a JSON object:
         use_tavily=True,
         existing_context="",   # force fresh search
         call_state=None,
+        search_provider=search_provider,
     )
     v = batch.get(field_name, {'status': 'unverifiable', 'claim': claim})
     return v, True
@@ -1062,6 +1359,7 @@ def verify_research(
     _settings = settings or {}
     use_tavily_setting = _settings.get('verification_tavily_enabled', None)
     use_tavily = TAVILY_ENABLED if use_tavily_setting is None else bool(use_tavily_setting)
+    search_provider = _settings.get('search_provider', 'duckduckgo')
 
     def _log(msg):
         logger.info(msg)
@@ -1070,11 +1368,10 @@ def verify_research(
 
     n_companies = len(research_result.get('companies', []))
     n_confs = len(research_result.get('conferences', []))
-    cap_str = f", cap={TAVILY_MAX_CALLS}" if TAVILY_MAX_CALLS > 0 else ""
+    cap_str = f", cap={TAVILY_MAX_CALLS}" if (search_provider == 'tavily' and TAVILY_MAX_CALLS > 0) else ""
     _log(f"=== Verification Pass ===")
-    _log(f"  Tavily: {'enabled' if use_tavily else 'disabled'}{cap_str} | ~{n_companies + n_confs + 1} calls max")
+    _log(f"  Search: {search_provider} ({'enabled' if use_tavily else 'disabled'}){cap_str} | ~{n_companies + n_confs + 1} calls max")
 
-    # Shared mutable Tavily call counter
     call_state = {'count': 0}
 
     _log(f"--- Verifying sector brief... (1/3) ---")
@@ -1083,6 +1380,7 @@ def verify_research(
         log_fn=log_fn,
         use_tavily=use_tavily,
         call_state=call_state,
+        search_provider=search_provider,
     )
 
     _log(f"--- Verifying {n_confs} conferences... (2/3) ---")
@@ -1094,6 +1392,7 @@ def verify_research(
             use_tavily=use_tavily,
             existing_context=conferences_context,
             call_state=call_state,
+            search_provider=search_provider,
         ))
 
     _log(f"--- Verifying {n_companies} companies... (3/3) ---")
@@ -1106,9 +1405,13 @@ def verify_research(
             use_tavily=use_tavily,
             existing_context=companies_context,
             call_state=call_state,
+            search_provider=search_provider,
         ))
 
-    _log(f"=== Verification complete — {call_state['count']} Tavily calls used ===")
+    if search_provider == 'tavily':
+        _log(f"=== Verification complete — {call_state['count']} Tavily calls used ===")
+    else:
+        _log(f"=== Verification complete ({search_provider}, no call cap) ===")
 
     return {
         'sector_brief': research_result['sector_brief'],

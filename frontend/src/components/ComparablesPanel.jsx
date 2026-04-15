@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { API_BASE } from '../config'
+import { useSettings } from './SettingsContext'
 
 function dealTypeClass(type) {
   const t = (type || '').toLowerCase()
@@ -50,6 +51,7 @@ function TransactionRow({ tx, expanded, onToggle }) {
 // ComparablesPanel — used both on main results page and inside CompanyModal
 // ---------------------------------------------------------------------------
 export default function ComparablesPanel({ thesis, sectorBrief, transactions, onLoaded }) {
+  const { settings } = useSettings()
   const [phase, setPhase] = useState(transactions ? 'loaded' : 'loading') // loading | loaded | error
   const [logs, setLogs] = useState([])
   const [error, setError] = useState('')
@@ -72,7 +74,7 @@ export default function ComparablesPanel({ thesis, sectorBrief, transactions, on
       const resp = await fetch(`${API_BASE}/api/comparables`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thesis, sector_brief: sectorBrief }),
+        body: JSON.stringify({ thesis, sector_brief: sectorBrief, settings }),
         signal: controller.signal,
       })
 

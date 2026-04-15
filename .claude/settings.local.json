@@ -12,7 +12,16 @@
       "Bash(python:*)",
       "Bash(python3:*)",
       "Bash(ls:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "WebFetch(domain:openrouter.ai)",
+      "Bash(curl -s \"https://openrouter.ai/api/v1/models\")",
+      "Bash(curl -v \"https://openrouter.ai/api/v1/models\")",
+      "Bash(pip install:*)",
+      "Bash(find /Users/luismejia/Documents/dsail_project/backend -name \"*.pyc\" -delete)",
+      "Bash(find /Users/luismejia/Documents/dsail_project/backend -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Bash(.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"uvicorn main:app\")"
     ]
   }
 }

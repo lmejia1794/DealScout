@@ -12,10 +12,10 @@ function processCitations(text) {
   const urlToIndex = {}
   let refCounter = 0
 
-  const SUPERSCRIPTS = ['', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹']
-  const sup = (n) => n <= 9 ? SUPERSCRIPTS[n] : `[${n}]`
+  // Strip any incomplete citation at the very end (e.g. model hit token limit mid-marker)
+  const stripped = text.replace(/[【\[]\s*SRC:[^\]】]*$/, '').trimEnd()
 
-  const processed = text.replace(/\[SRC:\s*([^\]]+)\]/g, (match, source) => {
+  const processed = stripped.replace(/[【\[]SRC:\s*([^\]】]+)[】\]]/g, (match, source) => {
     source = source.trim()
     if (source.toLowerCase() === 'model_inference') return ''
     if (source.toLowerCase() === 'estimated') return ''
@@ -25,7 +25,8 @@ function processCitations(text) {
         urlToIndex[source] = refCounter
         citations.push({ index: refCounter, url: source, isReal: true })
       }
-      return ` [${sup(urlToIndex[source])}](${source})`
+      // Use plain number — the `a` component applies consistent superscript styling
+      return ` [${urlToIndex[source]}](${source})`
     }
     return ''
   })
@@ -50,10 +51,10 @@ const MD_COMPONENTS = {
   code: ({ children }) => <code className="bg-gray-100 rounded px-1 text-sm font-mono text-gray-800">{children}</code>,
   pre:  ({ children }) => <pre className="bg-gray-50 border border-gray-200 rounded-lg p-3 overflow-x-auto my-3 text-sm font-mono text-gray-800 whitespace-pre-wrap break-words">{children}</pre>,
   hr:   () => <hr className="border-gray-200 my-4" />,
-  // Superscript citation links
+  // Superscript citation links — consistent size for any digit count
   a: ({ href, children }) => (
     <a href={href} target="_blank" rel="noopener noreferrer"
-      className="text-blue-500 hover:text-blue-700 underline text-[13px] font-semibold align-super" onClick={e => e.stopPropagation()}>
+      className="text-blue-500 hover:text-blue-700 no-underline font-semibold align-super text-[10px]" onClick={e => e.stopPropagation()}>
       {children}
     </a>
   ),
@@ -121,8 +122,7 @@ function normalize(text) {
 // ---------------------------------------------------------------------------
 function CitationFootnotes({ citations, verificationMap = {} }) {
   if (!citations?.length) return null
-  const SUPERSCRIPTS = ['', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹']
-  const sup = (n) => n <= 9 ? SUPERSCRIPTS[n] : `[${n}]`
+  const sup = (n) => String(n)  // plain number — styled consistently via CSS
 
   const isHallucinated = (v) =>
     v?.citation_note?.toLowerCase().includes('hallucinated') ||
@@ -165,7 +165,7 @@ function CitationFootnotes({ citations, verificationMap = {} }) {
               })()
               return (
                 <div key={index} className="flex items-start gap-1.5 text-xs text-gray-500">
-                  <span className="shrink-0 text-gray-400 font-medium">{sup(index)}</span>
+                  <span className="shrink-0 text-gray-400 font-semibold text-[10px]">{sup(index)}</span>
                   <div className="min-w-0">
                     <a href={finalUrl} target="_blank" rel="noopener noreferrer"
                       className="text-blue-400 hover:underline truncate block"

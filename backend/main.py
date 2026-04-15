@@ -52,14 +52,17 @@ async def research(req: ResearchRequest):
         def log_fn(msg):
             log_q.put({"type": "log", "message": msg})
 
+        def phase_fn(phase, data):
+            log_q.put({"type": "phase_result", "phase": phase, "data": data})
+
         try:
-            result = run_research(req.thesis, known_companies=req.known_companies, settings=req.settings, log_fn=log_fn)
+            result = run_research(req.thesis, settings=req.settings, log_fn=log_fn, phase_fn=phase_fn)
             result_holder["data"] = result
         except RuntimeError as e:
             result_holder["error"] = str(e)
         except Exception as e:
             logger.exception("Unexpected error in run_research")
-            result_holder["error"] = "An unexpected error occurred on the server."
+            result_holder["error"] = f"Unexpected server error: {type(e).__name__}: {e}"
         finally:
             log_q.put(None)  # sentinel — pipeline finished
 
@@ -238,7 +241,7 @@ async def comparables(req: ComparablesRequest):
         def log_fn(msg):
             q.put({"type": "log", "message": msg})
         try:
-            transactions = generate_comparables(req.thesis, req.sector_brief, log_fn=log_fn)
+            transactions = generate_comparables(req.thesis, req.sector_brief, log_fn=log_fn, settings=req.settings)
             q.put({"type": "result", "data": {"transactions": transactions}})
         except Exception as e:
             logger.exception("Error generating comparables")
@@ -269,6 +272,7 @@ async def verify_field_endpoint(req: FieldVerifyRequest):
 
     _settings = req.settings or {}
     use_tavily = bool(_settings.get('verification_tavily_enabled', TAVILY_ENABLED))
+    search_provider = _settings.get('search_provider', 'tavily')
 
     try:
         v_dict, tavily_used = verify_field(
@@ -277,6 +281,7 @@ async def verify_field_endpoint(req: FieldVerifyRequest):
             claim=req.claim,
             context=req.context or "",
             use_tavily=use_tavily,
+            search_provider=search_provider,
         )
         return FieldVerifyResponse(
             field_name=req.field_name,

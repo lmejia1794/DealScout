@@ -11,7 +11,7 @@ import re
 from search import _get_client, format_results, _run_search, _extract_keywords
 from research import (
     _call_json,
-    _web_llm_enabled,
+    _google_available,
     WEB_CTX_MAX,
     TODAY,
 )
@@ -29,7 +29,7 @@ def _clean_tx(tx: dict) -> dict:
 logger = logging.getLogger(__name__)
 
 
-def generate_comparables(thesis: str, sector_brief: str, log_fn=None) -> list:
+def generate_comparables(thesis: str, sector_brief: str, log_fn=None, settings: dict = None) -> list:
     """
     Generate 6–10 comparable M&A transactions relevant to the thesis.
     Returns a list of dicts matching ComparableTransaction shape.
@@ -40,10 +40,11 @@ def generate_comparables(thesis: str, sector_brief: str, log_fn=None) -> list:
             log_fn(msg)
 
     _log("=== Comparable Transactions ===")
+    settings = settings or {}
 
     # Step 1 — Tavily searches
-    if _web_llm_enabled():
-        _log("WEB_LLM mode — skipping Tavily searches for comparables")
+    if _google_available():
+        _log("Google AI mode — skipping Tavily searches for comparables")
         web_context = ""
     else:
         _log("Running Tavily searches for M&A comparables...")
@@ -63,7 +64,7 @@ def generate_comparables(thesis: str, sector_brief: str, log_fn=None) -> list:
 
     web_section = (
         "Use your web search capability to find real M&A transactions for this sector."
-        if _web_llm_enabled()
+        if _google_available()
         else f"Web search results:\n{web_context}"
     )
 
@@ -100,7 +101,7 @@ Return ONLY a raw JSON array where each object has exactly these keys:
 
 For reported_ev and reported_multiple: only append [SRC: url] when you found those specific figures in the search results. Do not invent URLs."""
 
-    transactions = _call_json(prompt, log_fn=log_fn)
+    transactions = _call_json(prompt, log_fn=log_fn, use_search=True, settings=settings)
     # Strip any [SRC: ...] citation markers from display fields
     transactions = [_clean_tx(tx) for tx in transactions if isinstance(tx, dict)]
     _log(f"Comparables complete ({len(transactions)} transactions)")

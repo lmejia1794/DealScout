@@ -4,7 +4,6 @@ from typing import Dict, Literal, Optional
 
 class ResearchRequest(BaseModel):
     thesis: str
-    known_companies: list[str] = []
     settings: Optional[dict] = None
 
 
@@ -178,7 +177,7 @@ class FieldVerifyResponse(BaseModel):
 
 class SettingsModel(BaseModel):
     temperature: float = 0.2
-    max_tokens_brief: int = 1500
+    max_tokens_brief: int = 3000
     max_tokens_json: int = 2000
     max_tokens_profile: int = 2500
     max_tokens_outreach: int = 500
@@ -189,7 +188,9 @@ class SettingsModel(BaseModel):
         "When asked to return markdown, return only markdown."
     )
     tavily_max_results: int = 5
-    ollama_model: str = "mixtral:8x7b-instruct-v0.1-q4_K_M"
+    google_model: str = "gemini-3-flash-preview"
+    google_use_search: bool = True
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
     source_scraping_enabled: bool = True
     contact_enrichment_enabled: bool = True
     verification_enabled: bool = True

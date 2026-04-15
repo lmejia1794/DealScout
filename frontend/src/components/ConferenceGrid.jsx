@@ -1,6 +1,8 @@
 import React, { useState } from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 
+const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
+
 const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december']
 function parseDateOrder(dateStr) {
   if (!dateStr) return Infinity
@@ -40,10 +42,10 @@ function ConferenceCard({ item, selected, onToggleSelect, conferencesContext, on
   const dateLocationCorrected = dlV?.status === 'contradicted' && dlV?.corrected_value && (!dlV?.human_override || dlV?.human_override === 'confirmed')
   const dateLocationDisputed = dlV?.human_override === 'disputed'
 
-  const displayDateLocation = dateLocationCorrected && !dateLocationDisputed
+  const displayDateLocation = stripCitations(dateLocationCorrected && !dateLocationDisputed
     ? dlV.corrected_value
-    : `${conf.date} · ${conf.location}`
-  const originalDateLocation = `${conf.date} · ${conf.location}`
+    : `${conf.date} · ${conf.location}`)
+  const originalDateLocation = stripCitations(`${conf.date} · ${conf.location}`)
 
   const badgeProps = (fieldName) => ({
     entityName: conf.name,
@@ -98,8 +100,8 @@ function ConferenceCard({ item, selected, onToggleSelect, conferencesContext, on
         <CostBadge cost={conf.estimated_cost} />
       </div>
 
-      <p className="text-xs text-gray-600 leading-relaxed">{conf.description}</p>
-      <p className="text-xs text-gray-500 italic">{conf.relevance}</p>
+      <p className="text-xs text-gray-600 leading-relaxed">{stripCitations(conf.description)}</p>
+      <p className="text-xs text-gray-500 italic">{stripCitations(conf.relevance)}</p>
 
       {conf.notable_attendees?.length > 0 && (
         <div className="flex flex-wrap gap-1 items-center">

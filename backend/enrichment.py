@@ -1,10 +1,10 @@
 """
 enrichment.py — Contact enrichment for DealScout decision makers.
 
-Three sequential methods per person:
-  1. Website scraping    — scrape /team, /about, /contact pages for email + phone
-  2. SMTP verification   — generate email patterns, verify via SMTP handshake
-  3. Gemini web search   — LLM-powered search for contact info in public records
+Three methods per person (Methods 1 & 2 are fast; all DMs run in parallel via profile.py):
+  1. Website scraping — fetch /team, /contact, /about, homepage concurrently for email + phone
+  2. Pattern generation — generate most-likely email pattern at low confidence (instant)
+  3. Gemini web search  — LLM-powered search for contact info in public records
 
 Always returns a ContactInfo object. Never raises.
 """
@@ -13,8 +13,8 @@ import json
 import logging
 import os
 import re
-import smtplib
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import httpx
@@ -74,7 +74,7 @@ def _is_complete(c: dict) -> bool:
 def _fetch_page(url: str) -> Optional[str]:
     """Fetch a URL, return HTML string or None on failure."""
     try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
+        with httpx.Client(timeout=5, follow_redirects=True) as client:
             resp = client.get(url, headers={"User-Agent": _BROWSER_UA})
             if resp.status_code == 200:
                 return resp.text
@@ -162,14 +162,26 @@ def _method1_website(
 
     base = company_website.rstrip("/")
     pages = [
-        f"{base}/team", f"{base}/about", f"{base}/about-us",
-        f"{base}/contact", f"{base}/management", f"{base}/leadership",
+        f"{base}/team", f"{base}/contact", f"{base}/about",
         base,
     ]
 
-    log_fn("  Method 1: Scraping company website...")
+    log_fn("  Method 1: Scraping company website (parallel)...")
+
+    # Fetch all candidate pages concurrently
+    page_results: dict[str, Optional[str]] = {}
+    with ThreadPoolExecutor(max_workers=len(pages)) as pool:
+        future_to_url = {pool.submit(_fetch_page, url): url for url in pages}
+        for future in as_completed(future_to_url, timeout=8):
+            url = future_to_url[future]
+            try:
+                page_results[url] = future.result()
+            except Exception:
+                page_results[url] = None
+
+    # Process pages in priority order (team → contact → about → homepage)
     for page_url in pages:
-        html = _fetch_page(page_url)
+        html = page_results.get(page_url)
         if not html:
             continue
 
@@ -179,12 +191,10 @@ def _method1_website(
         if idx == -1:
             continue  # person not mentioned on this page
 
-        # Extract from a window around the name mention
         window = text[max(0, idx - 200): idx + 2000]
 
         if not contact.get("email"):
             emails = _extract_emails_from_html(html)
-            # prefer emails near the name
             window_emails = _EMAIL_RE.findall(window)
             chosen = window_emails[0] if window_emails else (emails[0] if emails else None)
             if chosen:
@@ -202,84 +212,29 @@ def _method1_website(
                 log_fn(f"  Method 1: Found phone number (high confidence)")
 
         if contact.get("email") or contact.get("phone"):
-            return contact  # found something — stop paging
+            return contact
 
     log_fn("  Method 1: No contact info found on website pages")
     return contact
 
 
 # ---------------------------------------------------------------------------
-# Method 2 — SMTP verification
+# Method 2 — Email pattern generation (low confidence, instant)
+# SMTP probing removed: blocked by virtually all modern providers (Google
+# Workspace, M365), wastes ~25 s per person, and yields the same low-
+# confidence pattern we generate here directly.
 # ---------------------------------------------------------------------------
 
-def _smtp_verify(email: str, mx_host: str) -> bool:
-    try:
-        with smtplib.SMTP(mx_host, 25, timeout=5) as smtp:
-            smtp.ehlo("dealscout.app")
-            code, _ = smtp.rcpt(email)
-            return code == 250
-    except Exception:
-        return False
-
-
-def _method2_smtp(
-    first: str,
-    last: str,
-    domain: str,
-    log_fn,
-) -> dict:
+def _method2_pattern(first: str, last: str, domain: str, log_fn) -> dict:
     contact = _empty_contact()
     if not domain or not first or not last:
         return contact
-
     candidates = _email_candidates(first, last, domain)
-    log_fn(f"  Method 2: Trying SMTP verification ({len(candidates)} patterns)...")
-
-    try:
-        import dns.resolver
-        records = dns.resolver.resolve(domain, "MX")
-        mx_host = str(sorted(records, key=lambda r: r.preference)[0].exchange).rstrip(".")
-    except Exception as e:
-        log_fn(f"  Method 2: DNS lookup failed ({e}) — using pattern as low confidence")
-        contact["email"] = candidates[0]
-        contact["email_confidence"] = "low"
-        contact["email_source"] = "pattern_unverified"
-        contact["enrichment_notes"] = f"DNS lookup failed: {e}"
-        return contact
-
-    smtp_blocked = False
-    all_550 = True
-
-    for candidate in candidates:
-        try:
-            verified = _smtp_verify(candidate, mx_host)
-            if verified:
-                contact["email"] = candidate
-                contact["email_confidence"] = "high"
-                contact["email_source"] = "smtp_verified"
-                log_fn(f"  Method 2: SMTP verified {candidate}")
-                return contact
-            else:
-                # 550 = exists but rejected — domain is valid
-                pass
-        except Exception as e:
-            err = str(e).lower()
-            if any(k in err for k in ["refused", "timed out", "timeout", "blocked"]):
-                smtp_blocked = True
-                all_550 = False
-            log_fn(f"  Method 2: SMTP error for {candidate}: {e}")
-
-    # Fall back to first pattern at low confidence
     contact["email"] = candidates[0]
     contact["email_confidence"] = "low"
     contact["email_source"] = "pattern_unverified"
-    if smtp_blocked:
-        note = "SMTP verification blocked by mail provider"
-        log_fn(f"  Method 2: {note} — pattern saved as low confidence")
-    else:
-        note = "SMTP returned 550 for all patterns"
-        log_fn(f"  Method 2: {note} — pattern saved as low confidence")
-    contact["enrichment_notes"] = note
+    contact["enrichment_notes"] = "Email pattern generated; not SMTP-verified"
+    log_fn(f"  Method 2: Generated pattern {candidates[0]} (low confidence)")
     return contact
 
 
@@ -296,9 +251,8 @@ def _method3_web_search(
 ) -> dict:
     contact = _empty_contact()
     try:
-        from research import _call_openrouter
-        model = os.getenv("WEB_LLM_MODEL", "google/gemini-2.0-flash-001")
-        log_fn("  Method 3: Gemini web search...")
+        from research import _call_llm
+        log_fn("  Method 3: AI web search...")
 
         prompt = f"""Find the professional email address and/or direct phone number for {name}, who is {title} at {company_name} ({company_website or 'website unknown'}).
 
@@ -317,9 +271,16 @@ Return ONLY a raw JSON object:
   "notes": "string or null"
 }}"""
 
-        from research import _strip_json_fences
-        raw = _call_openrouter(model, prompt, 300)
-        data = json.loads(_strip_json_fences(raw))
+        from research import _strip_json_fences, _escape_control_chars
+        raw = _call_llm(prompt, 300, use_search=True)
+        cleaned = _escape_control_chars(_strip_json_fences(raw))
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            from json_repair import repair_json
+            data = repair_json(cleaned, return_objects=True)
+            if not isinstance(data, dict):
+                data = {}
 
         if data.get("email"):
             contact["email"] = data["email"]
@@ -395,9 +356,9 @@ def enrich_contact(
             _log(f"  Enrichment complete — email: {contact.get('email_confidence')}, phone: {contact.get('phone_confidence')}")
             return contact
 
-        # --- Method 2: SMTP verification (email only, only if not already found) ---
+        # --- Method 2: Email pattern (instant — no SMTP, just generate the most likely pattern) ---
         if not contact.get("email") and domain and first_name and last_name:
-            m2 = _method2_smtp(first_name, last_name, domain, _log)
+            m2 = _method2_pattern(first_name, last_name, domain, _log)
             contact.update({k: v for k, v in m2.items() if v is not None and not contact.get(k)})
 
         if _is_complete(contact):
@@ -410,7 +371,10 @@ def enrich_contact(
 
         if not email_ok or not phone_ok:
             m3 = _method3_web_search(name, title, company_name, company_website, _log)
-            if not contact.get("email") and m3.get("email"):
+            # Upgrade if: no email yet, OR current email is only a low-confidence pattern
+            if m3.get("email") and (
+                not contact.get("email") or contact.get("email_confidence") == "low"
+            ):
                 contact["email"] = m3["email"]
                 contact["email_confidence"] = m3.get("email_confidence")
                 contact["email_source"] = m3.get("email_source")

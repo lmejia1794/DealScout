@@ -20,6 +20,7 @@ const PHASES = [
 ]
 
 const LS_KEY = 'dealscout_searches'
+const SS_KEY = 'dealscout_session'
 
 function loadSaved() {
   try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]') }
@@ -30,6 +31,18 @@ function saveToDisk(searches) {
 }
 function truncate(str, n) {
   return str.length > n ? str.slice(0, n - 1) + '…' : str
+}
+
+function loadSession() {
+  try { return JSON.parse(sessionStorage.getItem(SS_KEY) || 'null') }
+  catch { return null }
+}
+function saveSession(data) {
+  try { sessionStorage.setItem(SS_KEY, JSON.stringify(data)) }
+  catch {} // ignore QuotaExceededError
+}
+function clearSession() {
+  try { sessionStorage.removeItem(SS_KEY) } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -131,11 +144,12 @@ function PipelineProgress({ logs, loading, onStop }) {
 // ---------------------------------------------------------------------------
 function LogPanel({ logs, loading }) {
   const [expanded, setExpanded] = useState(false)
-  const bottomRef = useRef(null)
+  const scrollContainerRef = useRef(null)
 
   useEffect(() => {
-    if (expanded && bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: 'smooth' })
+    if (expanded && scrollContainerRef.current) {
+      const el = scrollContainerRef.current
+      el.scrollTop = el.scrollHeight
     }
   }, [logs, expanded])
 
@@ -160,7 +174,7 @@ function LogPanel({ logs, loading }) {
       </button>
 
       {expanded && (
-        <div className="bg-gray-950 px-4 py-3 max-h-72 overflow-y-auto font-mono text-xs">
+        <div ref={scrollContainerRef} className="bg-gray-950 px-4 py-3 max-h-72 overflow-y-auto font-mono text-xs">
           {logs.map((line, i) => {
             const isPhase = line.startsWith('===')
             const isError = line.startsWith('ERROR')
@@ -186,7 +200,6 @@ function LogPanel({ logs, loading }) {
           {loading && (
             <div className="text-gray-500 animate-pulse mt-1">› …</div>
           )}
-          <div ref={bottomRef} />
         </div>
       )}
     </div>
@@ -237,23 +250,33 @@ function ConfidenceSummaryBar({ results, tavilyCallsUsed, tavilyMax }) {
 // App
 // ---------------------------------------------------------------------------
 export default function App() {
-  const [results, setResults] = useState(null)
+  // Restore session state (survives navigation to /report and back)
+  const _session = loadSession()
+
+  const [results, setResults] = useState(_session?.results || null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [phaseLabel, setPhaseLabel] = useState(PHASES[0].label)
   const [logs, setLogs] = useState([])
   const [savedSearches, setSavedSearches] = useState(loadSaved)
-  const [currentThesis, setCurrentThesis] = useState('')
+  const [currentThesis, setCurrentThesis] = useState(_session?.currentThesis || '')
   const [modalCompany, setModalCompany] = useState(null)
-  const [comparables, setComparables] = useState(null)      // null = not yet loaded
-  const [selectedCompanies, setSelectedCompanies] = useState([])
-  const [selectedConferences, setSelectedConferences] = useState([])
-  const [profiles, setProfiles] = useState({})             // keyed by company name
+  const [comparables, setComparables] = useState(_session?.comparables || null)
+  const [selectedCompanies, setSelectedCompanies] = useState(_session?.selectedCompanies || [])
+  const [selectedConferences, setSelectedConferences] = useState(_session?.selectedConferences || [])
+  const [profiles, setProfiles] = useState(_session?.profiles || {})
   const [preparingReport, setPreparingReport] = useState(false)
   const [tavilyCallsUsed, setTavilyCallsUsed] = useState(0)
+  // Draft entry shown in left nav while research is in progress
+  const [currentDraft, setCurrentDraft] = useState(null)
   const abortRef = useRef(null)
   const navigate = useNavigate()
   const { settings } = useSettings()
+
+  // Persist session to sessionStorage so state survives navigating to /report and back
+  useEffect(() => {
+    saveSession({ results, currentThesis, comparables, selectedCompanies, selectedConferences, profiles })
+  }, [results, currentThesis, comparables, selectedCompanies, selectedConferences, profiles])
 
   // Derive phase label from latest log line
   useEffect(() => {
@@ -282,7 +305,7 @@ export default function App() {
     })
   }
 
-  const handleSearch = async (thesis, known_companies = []) => {
+  const handleSearch = async (thesis) => {
     if (abortRef.current) abortRef.current.abort()
     const controller = new AbortController()
     abortRef.current = controller
@@ -298,11 +321,15 @@ export default function App() {
     setSelectedConferences([])
     setProfiles({})
 
+    // Create draft entry for left nav so it's visible if user navigates away
+    const draftId = crypto.randomUUID()
+    setCurrentDraft({ id: draftId, label: truncate(thesis, 60), thesis, is_draft: true, saved_at: new Date().toISOString() })
+
     try {
       const response = await fetch(`${API_BASE}/api/research`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thesis, known_companies, settings }),
+        body: JSON.stringify({ thesis, settings }),
         signal: controller.signal,
       })
 
@@ -330,11 +357,16 @@ export default function App() {
 
           if (event.type === 'log') {
             setLogs(prev => [...prev, event.message])
+          } else if (event.type === 'phase_result') {
+            setResults(prev => ({ ...(prev || {}), ...event.data }))
+            setCurrentDraft(prev => prev ? { ...prev, ...event.data } : null)
           } else if (event.type === 'result') {
             setResults(event.data)
+            setCurrentDraft(null) // research complete — moves to savedSearches
             autoSave(thesis, event.data, null)
           } else if (event.type === 'error') {
             setError(event.message)
+            setCurrentDraft(prev => prev ? { ...prev, is_error: true } : null)
           }
         }
       }
@@ -360,6 +392,8 @@ export default function App() {
     setSelectedConferences([])
     setProfiles({})
     setTavilyCallsUsed(0)
+    setCurrentDraft(null)
+    clearSession()
   }
 
   // Update a single verification field in results state (from on-demand verify)
@@ -500,6 +534,7 @@ export default function App() {
         </div>
         <SavedSearches
           searches={savedSearches}
+          draft={currentDraft}
           onSelect={handleSelect}
           onDelete={handleDelete}
           onNew={handleNew}
@@ -537,40 +572,50 @@ export default function App() {
           </div>
         )}
 
-        {/* Results */}
-        {results && !loading && (
+        {/* Results — shown progressively as each phase completes */}
+        {results && (
           <div className="mt-8 space-y-8">
-            <ConfidenceSummaryBar
-              results={results}
-              tavilyCallsUsed={tavilyCallsUsed}
-              tavilyMax={settings.verification_tavily_max_calls || 20}
-            />
-            <SectorBrief content={results.sector_brief} verification={results.sector_brief_verification} />
-            <ConferenceGrid
-              conferences={results.conferences}
-              selectedConferences={selectedConferences}
-              onToggleConference={toggleConference}
-              conferencesContext={results._conferences_context || ''}
-              onUpdateVerification={(name, field, v) => handleUpdateVerification('conference', name, field, v)}
-              sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
-              onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
-            />
-            <CompanyList
-              companies={results.companies}
-              onViewProfile={setModalCompany}
-              selectedCompanies={selectedCompanies}
-              onToggleCompany={toggleCompany}
-              companiesContext={results._companies_context || ''}
-              onUpdateVerification={(name, field, v) => handleUpdateVerification('company', name, field, v)}
-              sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
-              onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
-            />
-            <ComparablesPanel
-              thesis={currentThesis}
-              sectorBrief={results.sector_brief}
-              transactions={comparables}
-              onLoaded={handleComparablesLoaded}
-            />
+            {!loading && (
+              <ConfidenceSummaryBar
+                results={results}
+                tavilyCallsUsed={tavilyCallsUsed}
+                tavilyMax={settings.verification_tavily_max_calls || 20}
+              />
+            )}
+            {results.sector_brief && (
+              <SectorBrief content={results.sector_brief} verification={results.sector_brief_verification} />
+            )}
+            {results.conferences && (
+              <ConferenceGrid
+                conferences={results.conferences}
+                selectedConferences={selectedConferences}
+                onToggleConference={toggleConference}
+                conferencesContext={results._conferences_context || ''}
+                onUpdateVerification={(name, field, v) => handleUpdateVerification('conference', name, field, v)}
+                sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
+                onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
+              />
+            )}
+            {results.companies && (
+              <CompanyList
+                companies={results.companies}
+                onViewProfile={setModalCompany}
+                selectedCompanies={selectedCompanies}
+                onToggleCompany={toggleCompany}
+                companiesContext={results._companies_context || ''}
+                onUpdateVerification={(name, field, v) => handleUpdateVerification('company', name, field, v)}
+                sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
+                onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
+              />
+            )}
+            {!loading && (
+              <ComparablesPanel
+                thesis={currentThesis}
+                sectorBrief={results.sector_brief}
+                transactions={comparables}
+                onLoaded={handleComparablesLoaded}
+              />
+            )}
           </div>
         )}
       </main>

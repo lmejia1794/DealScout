@@ -16,10 +16,12 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import date
 
+from google import genai
+from google.genai import types as genai_types
 import httpx
-import ollama as ollama_lib
 from openai import OpenAI
 
 from search import search_for_sector_brief, search_for_conferences, search_for_companies, _extract_keywords
@@ -33,7 +35,7 @@ SYSTEM_PROMPT = (
     "When asked to return markdown, return only markdown."
 )
 TEMPERATURE = 0.2
-JSON_TOKENS = 8000
+JSON_TOKENS = 12000
 BRIEF_TOKENS = 6000  # explicit large limit — avoids Ollama misinterpreting num_predict=-1
 
 # Maximum characters of Tavily web context to inject per prompt.
@@ -160,127 +162,524 @@ def _build_size_constraints(thesis: str) -> str:
 # LLM client abstraction
 # ---------------------------------------------------------------------------
 
-def _ollama_available() -> bool:
-    host = os.getenv("OLLAMA_HOST", "")
-    if not host:
-        return False
-    try:
-        httpx.get(f"{host}/api/version", timeout=3)
-        return True
-    except Exception:
-        return False
+def _google_available() -> bool:
+    return bool(os.getenv("GOOGLE_API_KEY", ""))
 
 
-def _web_llm_enabled() -> bool:
-    return os.getenv("WEB_LLM", "").lower() in ("1", "true", "yes")
-
-
-def _call_ollama(host: str, model: str, prompt: str, max_tokens: int, log_fn=None) -> str:
+def _collect_grounding_chunks(candidate, collector: list) -> None:
     """
-    Call the Ollama /api/chat endpoint directly via httpx.
+    Extract all grounding chunk URLs+titles from a Gemini response and append them
+    to `collector` as {'uri': str, 'title': str} dicts.
 
-    We bypass the ollama Python library here because it silently drops unknown
-    options (including num_ctx) in some versions, causing the model to use the
-    server's default context window — which may be too small for our prompts.
-    Direct HTTP gives us exact control over every parameter.
+    Used for JSON responses (inject_grounding_citations=False) so that the source
+    URLs from Gemini's search are not lost — they get forwarded to the verification
+    layer instead of being injected into field value strings.
+    """
+    try:
+        gm = getattr(candidate, 'grounding_metadata', None)
+        if not gm:
+            return
+        chunks = list(getattr(gm, 'grounding_chunks', None) or [])
+        for chunk in chunks:
+            web = getattr(chunk, 'web', None)
+            if not web:
+                continue
+            uri = getattr(web, 'uri', None) or ''
+            title = getattr(web, 'title', None) or ''
+            if uri.startswith('http'):
+                collector.append({'uri': uri, 'title': title})
+    except Exception as exc:
+        logger.debug("Grounding chunk collection failed: %s", exc)
+
+
+def _find_best_grounding_url(chunks: list, name: str, website: str = '') -> str:
+    """
+    Match a company/conference name and website to the most relevant grounding chunk URL.
+    Returns the best-matching URL, or None if no confident match found.
+    """
+    if not chunks:
+        return None
+    name_lower = (name or '').lower()
+    # Significant words from the name (skip short stop-words)
+    name_words = [w for w in name_lower.split() if len(w) > 3]
+
+    website_domain = ''
+    if website:
+        try:
+            from urllib.parse import urlparse
+            website_domain = urlparse(website).netloc.replace('www.', '').lower()
+        except Exception:
+            pass
+
+    best_url, best_score = None, 0
+    for chunk in chunks:
+        uri = chunk.get('uri', '')
+        title = (chunk.get('title') or '').lower()
+        uri_lower = uri.lower()
+        score = 0
+        # Strongest signal: company domain appears in the chunk URI
+        if website_domain and website_domain in uri_lower:
+            score += 10
+        # Moderate signal: name words in chunk title or URI
+        for word in name_words:
+            if word in title:
+                score += 2
+            if word in uri_lower:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_url = uri
+    # Only return a match if we have reasonable confidence (name words found)
+    return best_url if best_score >= 2 else None
+
+
+def _apply_grounding_citations(text: str, candidate) -> str:
+    """
+    Convert Gemini's grounding_supports metadata into our inline [SRC: url] citation format.
+
+    When Gemini uses Google Search grounding it populates grounding_metadata with:
+      grounding_chunks  — the source pages (URI + title)
+      grounding_supports — maps byte ranges in the response text to which chunks support them
+
+    We read those byte ranges and insert [SRC: url] immediately after each supported segment,
+    working back-to-front so earlier offsets are not shifted by later insertions.
+
+    Falls back to returning the original text unchanged on any error.
+    """
+    try:
+        gm = getattr(candidate, 'grounding_metadata', None)
+        if not gm:
+            return text
+
+        chunks = list(getattr(gm, 'grounding_chunks', None) or [])
+        supports = list(getattr(gm, 'grounding_supports', None) or [])
+        if not chunks or not supports:
+            return text
+
+        # Build index → URL mapping from grounding chunks.
+        # vertexaisearch.cloud.google.com/grounding-api-redirect/... URLs are valid —
+        # they redirect to the real source page and should be preserved as citations.
+        url_map: dict = {}
+        for i, chunk in enumerate(chunks):
+            web = getattr(chunk, 'web', None)
+            if web:
+                uri = getattr(web, 'uri', None) or ''
+                if uri.startswith('http'):
+                    url_map[i] = uri
+
+        if not url_map:
+            return text
+
+        # Collect (end_byte_offset, url) for each grounding support.
+        # Segment offsets are byte offsets into the UTF-8-encoded response text.
+        encoded = text.encode('utf-8')
+        insertions: list = []
+        for support in supports:
+            seg = getattr(support, 'segment', None)
+            if not seg:
+                continue
+            end_idx = getattr(seg, 'end_index', None)
+            if end_idx is None:
+                continue
+            chunk_indices = list(getattr(support, 'grounding_chunk_indices', None) or [])
+            # Use the highest-confidence chunk (first in list) for the citation URL
+            url = next((url_map[i] for i in chunk_indices if i in url_map), None)
+            if url:
+                insertions.append((int(end_idx), url))
+
+        if not insertions:
+            return text
+
+        # Deduplicate by position, then sort descending so we insert back-to-front
+        seen: set = set()
+        deduped = []
+        for pos, url in sorted(insertions, key=lambda x: x[0], reverse=True):
+            if pos not in seen:
+                seen.add(pos)
+                deduped.append((pos, url))
+
+        for pos, url in deduped:
+            marker = f' [SRC: {url}]'.encode('utf-8')
+            encoded = encoded[:pos] + marker + encoded[pos:]
+
+        result = encoded.decode('utf-8', errors='replace')
+        logger.debug("Grounding: injected %d [SRC:] citations from grounding metadata", len(deduped))
+        return result
+
+    except Exception as exc:
+        logger.debug("Grounding citation extraction failed: %s", exc)
+        return text
+
+
+def _call_google(prompt: str, max_tokens: int, use_search: bool = False, log_fn=None, settings: dict = None, inject_grounding_citations: bool = True, _grounding_chunks_collector: list = None) -> str:
+    """
+    Call Google AI Studio (Gemini) via the google-genai SDK.
+    Free with no credit card required — get a key at aistudio.google.com.
+    Optionally enables Grounding with Google Search for real-time web data.
     """
     def _log(msg):
         logger.info(msg)
         if log_fn:
             log_fn(msg)
 
-    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": TEMPERATURE,
-            "num_predict": max_tokens,
-            "num_ctx": num_ctx,
-        },
-    }
-    with httpx.Client(timeout=600) as client:
-        resp = client.post(f"{host}/api/chat", json=payload)
-        resp.raise_for_status()
-        body = resp.json()
-        done_reason = body.get("done_reason", "unknown")
-        content = body["message"]["content"]
-        if done_reason == "length":
-            _log(
-                f"WARNING: Ollama hit token limit (done_reason=length) — "
-                f"response truncated at {len(content)} chars. "
-                f"num_ctx={num_ctx}. Lower WEB_CTX_MAX or increase OLLAMA_NUM_CTX."
+    settings = settings or {}
+    api_key = os.getenv("GOOGLE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY not set in .env")
+
+    model_name = settings.get("google_model") or os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+    client = genai.Client(api_key=api_key)
+
+    tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())] if use_search else None
+    if use_search:
+        _log("Google AI: Grounding with Google Search enabled")
+
+    config = genai_types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=TEMPERATURE,
+        max_output_tokens=max_tokens if max_tokens > 0 else 8192,
+        tools=tools,
+    )
+
+    _TRANSIENT_CODES = ("503", "429", "500", "502")
+    max_retries = 3
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
             )
-        else:
-            _log(f"Ollama done_reason={done_reason}, response={len(content)} chars")
-        return content
+            break  # success — exit retry loop
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc)
+            if any(code in err_str for code in _TRANSIENT_CODES):
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s
+                    _log(f"Google AI transient error (attempt {attempt + 1}/{max_retries}), retrying in {wait}s: {exc}")
+                    time.sleep(wait)
+                    continue
+            raise  # non-transient or exhausted retries → let caller handle
+    else:
+        raise RuntimeError(f"Google AI ({model_name}) failed after {max_retries} attempts: {last_exc}") from last_exc
+
+    # response.text is a convenience property that returns None when the
+    # response has grounding metadata parts or an unexpected finish_reason.
+    # Fall back to manually concatenating text parts from the first candidate.
+    text = response.text
+    if not text:
+        try:
+            candidate = response.candidates[0]
+            finish_reason = getattr(candidate, "finish_reason", None)
+            parts = (candidate.content.parts or []) if candidate.content else []
+            text = "".join(p.text for p in parts if getattr(p, "text", None))
+            if not text:
+                _log(f"Google AI empty response — finish_reason={finish_reason}, "
+                     f"candidates={len(response.candidates)}, parts={len(parts)}")
+                if use_search:
+                    # Retry once without search — grounding sometimes causes empty
+                    # responses under rate pressure; training knowledge is sufficient
+                    _log("Retrying without Google Search grounding...")
+                    config_no_search = genai_types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=TEMPERATURE,
+                        max_output_tokens=max_tokens if max_tokens > 0 else 8192,
+                    )
+                    r2 = client.models.generate_content(
+                        model=model_name, contents=prompt, config=config_no_search
+                    )
+                    r2_parts = (
+                        (r2.candidates[0].content.parts or [])
+                        if r2.candidates and r2.candidates[0].content
+                        else []
+                    )
+                    text = r2.text or "".join(
+                        p.text for p in r2_parts if getattr(p, "text", None)
+                    )
+                if not text:
+                    if finish_reason and str(finish_reason) not in ("FinishReason.STOP", "STOP", "1"):
+                        raise RuntimeError(
+                            f"Google AI stopped with finish_reason={finish_reason} "
+                            f"(model={model_name})"
+                        )
+                    raise RuntimeError(
+                        f"Google AI returned empty text (model={model_name}, "
+                        f"finish_reason={finish_reason})"
+                    )
+        except (IndexError, AttributeError, TypeError) as exc:
+            raise RuntimeError(
+                f"Google AI returned no candidates (model={model_name})"
+            ) from exc
+
+    # Process grounding metadata from the response candidate.
+    if use_search:
+        try:
+            candidate = response.candidates[0]
+            if inject_grounding_citations:
+                # Prose mode: inject [SRC: url] markers inline
+                text_with_citations = _apply_grounding_citations(text, candidate)
+                if text_with_citations != text:
+                    _log(f"Google AI: grounding citations injected ({text.count('[SRC:')} → {text_with_citations.count('[SRC:')} markers)")
+                    text = text_with_citations
+            if _grounding_chunks_collector is not None:
+                # JSON mode: collect chunk URLs for the verification layer instead
+                before = len(_grounding_chunks_collector)
+                _collect_grounding_chunks(candidate, _grounding_chunks_collector)
+                added = len(_grounding_chunks_collector) - before
+                if added:
+                    _log(f"Google AI: {added} grounding chunks collected for verification")
+        except Exception:
+            pass  # grounding extraction is best-effort; original text is still valid
+
+    _log(f"Google AI: {len(text)} chars, model={model_name}, search={use_search}")
+    return text
 
 
-def _call_openrouter(model: str, prompt: str, max_tokens: int) -> str:
+def _run_ddg_search(query: str, max_results: int = 5) -> str:
+    """Execute a DuckDuckGo search and return formatted results. Free, no API key."""
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return f'[Search: "{query}"]\n(no results)'
+        lines = [f'[Search: "{query}"]']
+        for r in results:
+            title = r.get("title", "Untitled")
+            body = r.get("body", "")[:800].replace("\n", " ")
+            url = r.get("href", "")
+            lines.append(f"- {title}: {body} ({url})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f'[Search: "{query}"]\n[Search failed: {e}]'
+
+
+def _call_openrouter(model: str, prompt: str, max_tokens: int, use_web_search: bool = False) -> str:
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
     if not openrouter_key:
         raise RuntimeError("OPENROUTER_API_KEY not set in .env")
     oc = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
-    kwargs: dict = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": TEMPERATURE,
-    }
+    messages: list = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    kwargs: dict = {"model": model, "messages": messages, "temperature": TEMPERATURE}
     if max_tokens > 0:
         kwargs["max_tokens"] = max_tokens
-    resp = oc.chat.completions.create(**kwargs)
-    return resp.choices[0].message.content
+    if use_web_search:
+        kwargs["extra_body"] = {"tools": [{"type": "openrouter:web_search"}]}
 
-
-def _call_llm(prompt: str, max_tokens: int, log_fn=None) -> str:
-    """
-    Routing logic:
-      1. If WEB_LLM=true  → OpenRouter web-capable model (skips Tavily).
-      2. If Ollama reachable → local Ollama.
-      3. Fallback → OpenRouter standard model.
-    """
-    if _web_llm_enabled():
-        model = os.getenv("WEB_LLM_MODEL", "google/gemini-2.0-flash-001")
-        logger.info("WEB_LLM mode — using OpenRouter model: %s", model)
-        return _call_openrouter(model, prompt, max_tokens)
-
-    host = os.getenv("OLLAMA_HOST", "")
-    model = os.getenv("OLLAMA_MODEL", "mixtral:8x7b-instruct-v0.1-q4_K_M")
-
-    if _ollama_available():
-        return _call_ollama(host, model, prompt, max_tokens, log_fn=log_fn)
-
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
-    if not openrouter_key:
-        raise RuntimeError(
-            "No AI backend configured. Please check your .env file."
-        )
-    if log_fn:
-        log_fn("Ollama unreachable — falling back to OpenRouter")
+    max_retries = 3
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            resp = oc.chat.completions.create(**kwargs)
+            if resp.choices:
+                break
+            # Empty choices — treat as retryable
+            last_exc = RuntimeError(f"OpenRouter returned empty choices for model {model} (attempt {attempt + 1})")
+        except Exception as e:
+            last_exc = e
+            err_str = str(e)
+            if "402" in err_str:
+                raise RuntimeError(
+                    f"OpenRouter: not enough credits for {model}. "
+                    "Lower 'Max tokens — brief/JSON' in Settings, switch to a free model, "
+                    "or add credits at openrouter.ai/settings/credits."
+                ) from e
+            if "404" in err_str:
+                raise RuntimeError(
+                    f"OpenRouter: model '{model}' is unavailable or has been removed. "
+                    "Switch to a different model in Settings."
+                ) from e
+            # Only retry on transient server/rate-limit errors
+            if "500" not in err_str and "429" not in err_str and "502" not in err_str and "503" not in err_str:
+                raise RuntimeError(f"OpenRouter API error ({model}): {e}") from e
+        if attempt < max_retries - 1:
+            wait = 2 ** attempt  # 1s, 2s
+            logger.warning("OpenRouter transient error for %s (attempt %d/%d), retrying in %ds: %s", model, attempt + 1, max_retries, wait, last_exc)
+            time.sleep(wait)
     else:
-        logger.warning("Ollama unreachable — falling back to OpenRouter")
-    or_model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
-    return _call_openrouter(or_model, prompt, max_tokens)
+        raise RuntimeError(f"OpenRouter API error ({model}) after {max_retries} attempts: {last_exc}") from last_exc
+
+    if not resp.choices:
+        raise RuntimeError(f"OpenRouter returned empty choices for model {model}")
+
+    # Tool-call loop — OpenRouter may not execute server-side tools transparently
+    # for all models. When the model returns tool_calls we run the search via
+    # Tavily and feed results back ourselves.
+    max_turns = 5
+    turns = 0
+    while resp.choices[0].finish_reason == "tool_calls" and turns < max_turns:
+        turns += 1
+        assistant_msg = resp.choices[0].message
+        # Append the assistant's tool-call turn
+        messages.append({
+            "role": "assistant",
+            "content": assistant_msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in (assistant_msg.tool_calls or [])
+            ],
+        })
+        # Execute each tool call and append results
+        for tc in (assistant_msg.tool_calls or []):
+            try:
+                args = json.loads(tc.function.arguments)
+                query = args.get("query") or args.get("q") or str(args)
+            except Exception:
+                query = tc.function.arguments
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": _run_ddg_search(query),
+            })
+        kwargs["messages"] = messages
+        try:
+            resp = oc.chat.completions.create(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"OpenRouter API error (tool loop turn {turns}, {model}): {e}") from e
+
+        if not resp.choices:
+            raise RuntimeError(f"OpenRouter returned empty choices for model {model} (tool loop turn {turns})")
+
+    content = resp.choices[0].message.content
+    if content is None:
+        raise RuntimeError(f"OpenRouter returned no content for model {model} (finish_reason={resp.choices[0].finish_reason})")
+    return content
+
+
+def _call_llm(prompt: str, max_tokens: int, log_fn=None, use_search: bool = False, settings: dict = None, inject_grounding_citations: bool = True, _grounding_chunks_collector: list = None) -> str:
+    """
+    Routing priority:
+      1. Google AI Studio (Gemini) — primary, free, native web search via grounding
+      2. OpenRouter (Llama 3.3 70B free) — fallback if GOOGLE_API_KEY missing or call fails
+    use_search: enables Grounding with Google Search for Google AI calls.
+    """
+    def _log(msg):
+        logger.info(msg)
+        if log_fn:
+            log_fn(msg)
+
+    settings = settings or {}
+    failures = []
+
+    # --- Primary: Google AI Studio (cascade Flash 3 → 2.5 → 2.0) ---
+    if _google_available():
+        google_search = use_search and settings.get(
+            "google_use_search",
+            os.getenv("GOOGLE_USE_SEARCH", "true").lower() in ("1", "true", "yes"),
+        )
+        # Build model list: user/env preference first, then fixed fallbacks
+        preferred = settings.get("google_model") or os.getenv("GOOGLE_MODEL", "gemini-3-flash-preview")
+        google_cascade = [preferred, "gemini-2.5-flash"]
+        # Deduplicate while preserving order
+        seen: set = set()
+        google_cascade = [m for m in google_cascade if not (m in seen or seen.add(m))]  # type: ignore[func-returns-value]
+
+        for gmodel in google_cascade:
+            try:
+                return _call_google(
+                    prompt, max_tokens,
+                    use_search=google_search, log_fn=log_fn,
+                    settings={**settings, "google_model": gmodel},
+                    inject_grounding_citations=inject_grounding_citations,
+                    _grounding_chunks_collector=_grounding_chunks_collector,
+                )
+            except Exception as e:
+                msg = f"Google AI ({gmodel}) failed: {e}"
+                _log(msg)
+                failures.append(msg)
+        _log("All Google models failed — falling back to OpenRouter")
+
+    # --- Fallback 1: OpenRouter (cascade: configured model → llama3 backstop) ---
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+    if openrouter_key:
+        _OR_BACKSTOP = "meta-llama/llama-3.3-70b-instruct:free"
+        or_primary = settings.get("openrouter_model") or os.getenv("OPENROUTER_MODEL", _OR_BACKSTOP)
+        or_cascade = [or_primary]
+        if or_primary != _OR_BACKSTOP:
+            or_cascade.append(_OR_BACKSTOP)  # always end with the reliable free backstop
+
+        for or_model in or_cascade:
+            try:
+                _log(f"Using OpenRouter: {or_model}")
+                return _call_openrouter(or_model, prompt, max_tokens)
+            except Exception as e:
+                msg = f"OpenRouter ({or_model}) failed: {e}"
+                _log(msg)
+                failures.append(msg)
+        _log("All OpenRouter models failed")
+
+    detail = "; ".join(failures) if failures else "no backends configured (set GOOGLE_API_KEY or OPENROUTER_API_KEY)"
+    raise RuntimeError(f"All AI backends failed ({detail})")
 
 
 def _strip_json_fences(text: str) -> str:
-    """Strip markdown code fences (```json ... ``` or ``` ... ```) from LLM output."""
+    """
+    Extract the JSON payload from LLM output.
+    Handles: markdown code fences, preamble text, trailing prose, and bare output.
+    """
     text = text.strip()
-    # Remove opening fence with optional language tag
-    text = re.sub(r'^```[a-zA-Z]*\s*', '', text)
-    # Remove closing fence
-    text = re.sub(r'\s*```$', '', text)
+    # If code fences are present, take only the content between the first pair
+    m = re.search(r'```[a-zA-Z]*\s*\n?([\s\S]*?)\s*```', text)
+    if m:
+        return m.group(1).strip()
+    # No fences — strip any preamble before the first JSON delimiter
+    first = re.search(r'[\[{]', text)
+    if first and first.start() > 0:
+        text = text[first.start():]
+    # Strip any postamble after the last closing delimiter
+    last = max(text.rfind(']'), text.rfind('}'))
+    if last >= 0:
+        text = text[:last + 1]
     return text.strip()
 
 
-def _call_json(prompt: str, log_fn=None) -> list:
+def _escape_control_chars(text: str) -> str:
+    """
+    Replace bare control characters (newline, tab, carriage return, etc.) that
+    appear inside JSON string values with their proper JSON escape sequences.
+    LLMs frequently emit these when they put multi-line text into a string field.
+    """
+    result = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == '\\' and in_string and i + 1 < len(text):
+            # Pass through the backslash + next char as a valid escape sequence
+            result.append(c)
+            result.append(text[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            in_string = not in_string
+            result.append(c)
+        elif in_string:
+            if c == '\n':
+                result.append('\\n')
+            elif c == '\r':
+                result.append('\\r')
+            elif c == '\t':
+                result.append('\\t')
+            elif ord(c) < 0x20:
+                result.append(f'\\u{ord(c):04x}')
+            else:
+                result.append(c)
+        else:
+            result.append(c)
+        i += 1
+    return ''.join(result)
+
+
+def _call_json(prompt: str, log_fn=None, use_search: bool = False, settings: dict = None, _grounding_chunks_collector: list = None) -> list:
     """
     Call the LLM expecting a JSON array. Retries once on parse failure.
     Returns parsed list or raises ValueError.
@@ -294,10 +693,30 @@ def _call_json(prompt: str, log_fn=None) -> list:
         prompt + "\n\nReturn ONLY a raw JSON array. Do not include ```json or any other text.",
         JSON_TOKENS,
         log_fn=log_fn,
+        use_search=use_search,
+        settings=settings,
+        inject_grounding_citations=False,  # JSON field values must not have citation markers
+        _grounding_chunks_collector=_grounding_chunks_collector,
     )
+
+    def _parse(s):
+        cleaned = _escape_control_chars(_strip_json_fences(s))
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Truncated response — attempt structural repair before giving up
+            try:
+                from json_repair import repair_json
+                repaired = repair_json(cleaned, return_objects=True)
+                if isinstance(repaired, list):
+                    _log(f"JSON repaired ({len(repaired)} items recovered from truncated output)")
+                    return repaired
+            except Exception:
+                pass
+            raise
+
     try:
-        parsed = json.loads(_strip_json_fences(raw))
-        return parsed
+        return _parse(raw)
     except json.JSONDecodeError:
         _log("JSON parse failed on first attempt — retrying with stricter prompt")
         retry_prompt = (
@@ -305,40 +724,70 @@ def _call_json(prompt: str, log_fn=None) -> list:
             + "\n\nYour previous response was not valid JSON. "
             "Return ONLY the raw JSON array with absolutely no other text."
         )
-        raw2 = _call_llm(retry_prompt, JSON_TOKENS, log_fn=log_fn)
-        return json.loads(_strip_json_fences(raw2))
+        raw2 = _call_llm(retry_prompt, JSON_TOKENS, log_fn=log_fn, use_search=use_search, settings=settings, inject_grounding_citations=False)
+        return _parse(raw2)
 
 
 # ---------------------------------------------------------------------------
 # Step 1 — Sector Brief
 # ---------------------------------------------------------------------------
 
-def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", citations_enabled: bool = False) -> str:
+def _strip_gemini_grounding_artifacts(text: str) -> str:
+    """
+    Remove artifacts that Gemini appends when Google Search grounding is active:
+
+    1. A trailing SOURCES / Sources / References section containing numbered lists
+       of vertexaisearch.cloud.google.com redirect URLs.  These consume token budget
+       and crowd out actual brief content.
+
+    2. Inline numbered footnote markers such as [1], [2], [10] that Gemini inserts
+       next to grounded claims in its own citation format (different from our
+       [SRC: url] markers).  Stripping them leaves prose clean; our own [SRC: ...]
+       markers are already handled by _apply_grounding_citations.
+    """
+    # Strip trailing SOURCES / References section.
+    # Pattern: one or more newlines → optional markdown heading hashes → section title
+    # → rest of document ([\s\S]* anchored at end).
+    # IGNORECASE handles "sources", "SOURCES", "Sources:", "## Sources", etc.
+    text = re.sub(
+        r'\n{1,3}(?:#{1,3}\s*)?(?:SOURCES?|References?|Citations?|Footnotes?|Bibliography):?\s*\n[\s\S]*$',
+        '',
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Strip inline numbered footnote markers [1] … [999].
+    # Only strip bare numbers — [SRC: ...] markers contain a colon and are preserved.
+    text = re.sub(r'\[\d+\]', '', text)
+    return text.strip()
+
+
+def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", citations_enabled: bool = False, settings: dict = None) -> str:
     def _log(msg):
         logger.info(msg)
         if log_fn:
             log_fn(msg)
 
-    if _web_llm_enabled():
-        _log(f"WEB_LLM mode — skipping Tavily, using {os.getenv('WEB_LLM_MODEL', 'google/gemini-2.0-flash-001')} with built-in search")
-        web_section = "Use your web search capability to find current data on this sector."
+    settings = settings or {}
+    search_provider = settings.get("search_provider", "tavily")
+
+    if _google_available():
+        # Gemini has native grounding — skip pre-injection, it will search itself
+        _log("Google AI: skipping pre-search (native grounding active)")
+        web_section = ""
+        citation_block = WEB_LLM_CITATION_BLOCK if citations_enabled else ""
     else:
-        _log("Running Tavily searches for sector brief...")
-        web_context = search_for_sector_brief(thesis)
+        _log(f"Running {search_provider} searches for sector brief...")
+        web_context = search_for_sector_brief(thesis, provider=search_provider)
         _log(f"Sector searches complete — {len(web_context.splitlines())} lines of context, {len(web_context)} chars")
         if extra_context:
             web_context = web_context + "\n\n" + extra_context
             _log(f"Injected scraped source context ({len(extra_context)} chars)")
         if WEB_CTX_MAX > 0 and len(web_context) > WEB_CTX_MAX:
             web_context = web_context[:WEB_CTX_MAX]
-            _log(f"Web context truncated to {WEB_CTX_MAX} chars (set WEB_CTX_MAX=0 to disable cap)")
+            _log(f"Web context truncated to {WEB_CTX_MAX} chars")
         web_section = f"Web search results:\n{web_context}"
+        citation_block = CITATION_PROMPT_BLOCK if citations_enabled else ""
     _log(f"Sending sector brief prompt (num_predict={BRIEF_TOKENS})...")
-
-    if citations_enabled:
-        citation_block = WEB_LLM_CITATION_BLOCK if _web_llm_enabled() else CITATION_PROMPT_BLOCK
-    else:
-        citation_block = ""
 
     prompt = f"""You are a senior private equity analyst at a European lower-middle-market B2B software fund (€20–150M EV deal range, Europe-only mandate). Write a structured sector brief for internal investment committee use. Be specific, data-driven, and Europe-focused. Every claim should be actionable for a deal team. Aim for 3–5 substantive, data-backed sentences per section — avoid generic statements.
 
@@ -409,7 +858,10 @@ Use ## for each section heading exactly as shown above. Write in clear, direct l
 
 IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the output in a JSON object or array, do NOT use code fences."""
     _log(f"Prompt size: {len(prompt)} chars (~{len(prompt)//4} tokens estimated)")
-    result = _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn)
+    result = _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=True, settings=settings)
+    # Strip Gemini grounding artifacts (SOURCES section + [N] footnote markers)
+    # before any validity or citation checks so they don't skew length/section counts.
+    result = _strip_gemini_grounding_artifacts(result)
 
     # Guard: if the model returned JSON instead of markdown, extract the text values
     stripped = result.strip()
@@ -437,6 +889,42 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
         except Exception:
             pass  # leave result as-is, normalize() in frontend will handle it
 
+    # Guard: detect garbled/truncated responses (too short or missing section headers).
+    # Causes: Gemini grounding failure, safety block, or response cut off mid-sentence.
+    # Retry once without web search grounding, which is the most common trigger.
+    def _brief_looks_valid(text: str) -> bool:
+        t = text.strip()
+        # Brief must have substantive content AND most of the 9 required sections.
+        # We require 7+ to allow slight variation (some models merge sections).
+        return len(t) >= 2000 and t.count('##') >= 7
+
+    if not _brief_looks_valid(result):
+        _log(
+            f"WARNING: sector brief looks invalid "
+            f"({len(result.strip())} chars, {result.count('##')} sections) — retrying without search grounding"
+        )
+        result = _strip_gemini_grounding_artifacts(
+            _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=False, settings=settings)
+        )
+        if not _brief_looks_valid(result):
+            _log(f"WARNING: retry also produced short brief ({len(result.strip())} chars) — returning as-is")
+
+    # Guard: if citations were requested but still none appear after grounding metadata
+    # extraction, the model produced no grounding supports at all (can happen when
+    # grounding returned no useful results). Retry without grounding so the model uses
+    # [SRC: training_knowledge] markers that our verifier can parse.
+    if citations_enabled and '[SRC:' not in result:
+        _log("WARNING: sector brief has no [SRC:] citations after grounding extraction — "
+             "retrying without search grounding for citation compliance")
+        citation_retry = _strip_gemini_grounding_artifacts(
+            _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=False, settings=settings)
+        )
+        if '[SRC:' in citation_retry and _brief_looks_valid(citation_retry):
+            result = citation_retry
+            _log("Citation retry succeeded")
+        else:
+            _log("Citation retry also produced no [SRC:] markers — returning as-is")
+
     _log(f"Sector brief complete ({len(result)} chars, ~{len(result)//4} tokens)")
     return result
 
@@ -445,26 +933,29 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
 # Step 2 — Conferences
 # ---------------------------------------------------------------------------
 
-def generate_conferences(thesis: str, sector_brief: str, log_fn=None, extra_context: str = "") -> tuple:
+def generate_conferences(thesis: str, sector_brief: str, log_fn=None, extra_context: str = "", settings: dict = None) -> tuple:
     def _log(msg):
         logger.info(msg)
         if log_fn:
             log_fn(msg)
 
+    settings = settings or {}
+    search_provider = settings.get("search_provider", "tavily")
+
     _raw_conferences_context = ""
-    if _web_llm_enabled():
-        _log(f"WEB_LLM mode — skipping Tavily search for conferences")
-        web_section = "Use your web search capability to find real upcoming conferences."
+    if _google_available():
+        _log("Google AI: skipping pre-search (native grounding active)")
+        web_section = ""
     else:
-        _log("Running Tavily searches for conferences...")
-        web_context = search_for_conferences(thesis)
-        _raw_conferences_context = web_context  # preserve for verification reuse
+        _log(f"Running {search_provider} searches for conferences...")
+        web_context = search_for_conferences(thesis, provider=search_provider)
+        _raw_conferences_context = web_context
         _log(f"Conference searches complete — {len(web_context.splitlines())} lines of context, {len(web_context)} chars")
         if extra_context:
             web_context = web_context + "\n\n" + extra_context
         if WEB_CTX_MAX > 0 and len(web_context) > WEB_CTX_MAX:
             web_context = web_context[:WEB_CTX_MAX]
-            _log(f"Web context truncated to {WEB_CTX_MAX} chars (set WEB_CTX_MAX=0 to disable cap)")
+            _log(f"Web context truncated to {WEB_CTX_MAX} chars")
         web_section = f"Web search results:\n{web_context}"
     _log("Calling LLM for conference list...")
 
@@ -488,8 +979,25 @@ Return a JSON array where each object has exactly these keys:
 - relevance (string, 1 sentence explaining relevance to the thesis)
 
 For date and location: only append [SRC: url] when you found that specific fact in the search results. Do not invent URLs."""
-    result = _call_json(prompt, log_fn=log_fn)
-    _log(f"Conference list complete ({len(result)} items)")
+    grounding_chunks: list = []
+    result = _call_json(prompt, log_fn=log_fn, use_search=True, settings=settings, _grounding_chunks_collector=grounding_chunks)
+    # With search grounding Gemini sometimes stops early (only returns what it found in search).
+    # Retry without grounding so the model can draw on training data for the full list.
+    if len(result) < 4:
+        _log(f"WARNING: only {len(result)} conferences from grounded call — retrying without search grounding")
+        retry = _call_json(prompt, log_fn=log_fn, use_search=False, settings=settings)
+        if len(retry) > len(result):
+            result = retry
+            grounding_chunks = []  # retry had no grounding
+        else:
+            _log(f"Retry did not improve count ({len(retry)} vs {len(result)}) — keeping original")
+    # Attach best-matching grounding URL to each conference for the verification layer
+    for conf in result:
+        if isinstance(conf, dict):
+            url = _find_best_grounding_url(grounding_chunks, conf.get('name', ''), conf.get('website', ''))
+            if url:
+                conf['_grounding_url'] = url
+    _log(f"Conference list complete ({len(result)} items, {len(grounding_chunks)} grounding chunks)")
     return result, _raw_conferences_context
 
 
@@ -497,66 +1005,35 @@ For date and location: only append [SRC: url] when you found that specific fact 
 # Step 3 — Company Universe
 # ---------------------------------------------------------------------------
 
-def generate_companies(thesis: str, sector_brief: str, known_companies: list = None, log_fn=None, extra_context: str = "") -> tuple:
+def generate_companies(thesis: str, sector_brief: str, log_fn=None, extra_context: str = "", settings: dict = None) -> tuple:
     def _log(msg):
         logger.info(msg)
         if log_fn:
             log_fn(msg)
 
-    known_companies = known_companies or []
+    settings = settings or {}
+    search_provider = settings.get("search_provider", "tavily")
 
     _raw_companies_context = ""
-    if _web_llm_enabled():
-        _log(f"WEB_LLM mode — skipping Tavily search for companies")
-        web_section = f"""Use your web search capability to find real companies matching this thesis.
-
-Thesis: "{thesis}"
-
-BEFORE you search, understand the target profile so you search efficiently:
-- European headquarters only (non-European HQ = instant disqualification, do not include)
-- Founder-led, family-owned, or early PE-backed (approaching end of hold) — NOT controlled by large strategic buyers
-- Sub-€200M EV — this means typically <€30M ARR for a SaaS company at market multiples
-- Independent company — not a subsidiary, division, or product line of a larger group
-
-DO NOT search for or include companies you already know fail these criteria. Skip immediately:
-- Any company acquired by a large strategic (e.g. WiseTech/CargoWise, E2open/BluJay, Oracle, SAP, Descartes)
-- Any US/Australian/Asian-headquartered company
-- Any company with >1,000 employees or ARR clearly above €50M
-- Any publicly listed company
-
-Search strategy — run targeted searches for companies that PASS the above criteria:
-1. Search by country + product type: "freight forwarding software Netherlands", "3PL TMS Germany founder-led", "logistics ERP Nordics independent"
-2. Search ecosystem directories: Microsoft AppSource logistics ISVs Europe, Dynamics 365 freight forwarding partners
-3. Search for "Mittelstand" logistics software companies, regional freight management software
-4. Search specifically for small/mid-market vendors not covered in mainstream logistics tech press
-
-The goal is to find 8–12 companies that genuinely qualify — well-known within their niche but NOT the large platforms."""
+    if _google_available():
+        _log("Google AI: skipping pre-search (native grounding active)")
+        web_section = ""
     else:
-        _log("Running Tavily searches for company universe...")
-        web_context = search_for_companies(thesis)
-        _raw_companies_context = web_context  # preserve for verification reuse
+        _log(f"Running {search_provider} searches for company universe...")
+        web_context = search_for_companies(thesis, provider=search_provider)
+        _raw_companies_context = web_context
         _log(f"Company searches complete — {len(web_context.splitlines())} lines of context, {len(web_context)} chars")
         if extra_context:
             web_context = web_context + "\n\n" + extra_context
         if WEB_CTX_MAX > 0 and len(web_context) > WEB_CTX_MAX:
             web_context = web_context[:WEB_CTX_MAX]
-            _log(f"Web context truncated to {WEB_CTX_MAX} chars (set WEB_CTX_MAX=0 to disable cap)")
+            _log(f"Web context truncated to {WEB_CTX_MAX} chars")
         web_section = f"Web search results:\n{web_context}"
 
     size_constraints = _build_size_constraints(thesis)
     if size_constraints:
         _log(f"Extracted size constraints from thesis — injecting into prompt")
-    if known_companies:
-        _log(f"Anchor companies injected: {', '.join(known_companies)}")
     _log("Calling LLM for company universe...")
-
-    anchor_block = ""
-    if known_companies:
-        names = ", ".join(f'"{c}"' for c in known_companies)
-        anchor_block = f"""
-ANCHOR COMPANIES — must include:
-The following companies have been pre-identified as strong potential fits. You MUST include ALL of them in your results, fully scored and described. Do not omit them regardless of what your searches return: {names}
-"""
 
     prompt = f"""Investment thesis: {thesis}
 
@@ -565,7 +1042,7 @@ The following companies have been pre-identified as strong potential fits. You M
 
 {web_section}
 
-Identify 8–12 specific, real European companies that match this investment thesis.{anchor_block}
+Identify 8–12 specific, real European companies that match this investment thesis.
 GEOGRAPHY — hard filter:
 - Only include companies whose REGISTERED LEGAL HEADQUARTERS is in a European country.
 - A European office or European customers do not qualify — the HQ must be in Europe.
@@ -601,8 +1078,26 @@ Return a JSON array where each object has exactly these keys:
 For founded, estimated_arr, employee_count, ownership: only append [SRC: url] when you found that specific fact in the search results above. Do not invent URLs.
 
 Sort the array by fit_score descending before returning."""
-    result = _call_json(prompt, log_fn=log_fn)
-    _log(f"Company universe complete ({len(result)} companies)")
+    grounding_chunks: list = []
+    result = _call_json(prompt, log_fn=log_fn, use_search=True, settings=settings, _grounding_chunks_collector=grounding_chunks)
+    # With search grounding Gemini sometimes stops early (constrains itself to what it
+    # found in search). Retry without grounding so the model fills the full 8–12 from
+    # training data + the sector brief context already in the prompt.
+    if len(result) < 6:
+        _log(f"WARNING: only {len(result)} companies from grounded call — retrying without search grounding")
+        retry = _call_json(prompt, log_fn=log_fn, use_search=False, settings=settings)
+        if len(retry) > len(result):
+            result = retry
+            grounding_chunks = []  # retry had no grounding
+        else:
+            _log(f"Retry did not improve count ({len(retry)} vs {len(result)}) — keeping original")
+    # Attach best-matching grounding URL to each company for the verification layer
+    for company in result:
+        if isinstance(company, dict):
+            url = _find_best_grounding_url(grounding_chunks, company.get('name', ''), company.get('website', ''))
+            if url:
+                company['_grounding_url'] = url
+    _log(f"Company universe complete ({len(result)} companies, {len(grounding_chunks)} grounding chunks)")
     return result, _raw_companies_context
 
 
@@ -610,7 +1105,7 @@ Sort the array by fit_score descending before returning."""
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_research(thesis: str, known_companies: list = None, settings: dict = None, log_fn=None) -> dict:
+def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None) -> dict:
     """
     Full Phase 1 pipeline. Returns dict matching ResearchResponse shape.
     Phase 2 steps (deep profiles, outreach, CRM, comps) can be appended here
@@ -627,12 +1122,13 @@ def run_research(thesis: str, known_companies: list = None, settings: dict = Non
     scraping_enabled = settings.get("source_scraping_enabled", True)
 
     # Step 0 — Source Discovery (best-effort, never blocks pipeline)
-    if scraping_enabled and not _web_llm_enabled():
+    # Skipped when Google AI is active — Gemini's native grounding replaces it
+    if scraping_enabled and not _google_available():
         _log("=== Step 0: Source Discovery ===")
         source_context = get_source_context(thesis, log_fn=log_fn)
     else:
-        if _web_llm_enabled():
-            _log("Step 0: Source Discovery skipped (WEB_LLM mode — model has built-in search)")
+        if _google_available():
+            _log("Step 0: Source Discovery skipped (Google AI active — native grounding used instead)")
         else:
             _log("Step 0: Source Discovery skipped (disabled in settings)")
         source_context = ""
@@ -640,24 +1136,32 @@ def run_research(thesis: str, known_companies: list = None, settings: dict = Non
     citations_enabled = settings.get("verification_citations_enabled", _CITATIONS_ENV)
 
     _log("=== Phase 1: Sector Brief ===")
-    sector_brief = generate_sector_brief(thesis, log_fn=log_fn, extra_context=source_context, citations_enabled=citations_enabled)
+    sector_brief = generate_sector_brief(thesis, log_fn=log_fn, extra_context=source_context, citations_enabled=citations_enabled, settings=settings)
+    if phase_fn:
+        phase_fn("sector_brief", {"sector_brief": sector_brief})
 
     _log("=== Phase 2: Conferences ===")
     conferences_context = ""
     try:
-        conferences, conferences_context = generate_conferences(thesis, sector_brief, log_fn=log_fn, extra_context=source_context)
+        conferences, conferences_context = generate_conferences(thesis, sector_brief, log_fn=log_fn, extra_context=source_context, settings=settings)
+        conferences = [c for c in conferences if isinstance(c, dict)]
     except (ValueError, json.JSONDecodeError) as e:
         _log(f"ERROR: Conference generation failed — {e}")
         conferences = []
+    if phase_fn:
+        phase_fn("conferences", {"conferences": conferences})
 
     _log("=== Phase 3: Company Universe ===")
     companies_context = ""
     try:
-        companies, companies_context = generate_companies(thesis, sector_brief, known_companies=known_companies, log_fn=log_fn, extra_context=source_context)
+        companies, companies_context = generate_companies(thesis, sector_brief, log_fn=log_fn, extra_context=source_context, settings=settings)
+        companies = [c for c in companies if isinstance(c, dict)]
         companies.sort(key=lambda c: c.get("fit_score", 0), reverse=True)
     except (ValueError, json.JSONDecodeError) as e:
         _log(f"ERROR: Company generation failed — {e}")
         companies = []
+    if phase_fn:
+        phase_fn("companies", {"companies": companies})
 
     _log("=== Research complete ===")
     raw_result = {

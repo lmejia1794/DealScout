@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
-import { useSettings, DEFAULTS } from './SettingsContext'
+import { useSettings } from './SettingsContext'
+import { DEFAULTS, OPENROUTER_MODELS, GOOGLE_MODELS } from './settingsDefaults'
 
 function Field({ label, hint, children }) {
   return (
@@ -102,14 +103,70 @@ export default function SettingsDrawer() {
             />
           </Field>
 
-          {/* Ollama model */}
-          <Field label="Ollama model" hint="Model tag as shown in `ollama list`.">
-            <input
-              type="text"
-              value={settings.ollama_model}
-              onChange={e => update('ollama_model', e.target.value)}
-              className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400"
-            />
+          {/* Search provider */}
+          <Field
+            label="Search provider"
+            hint={settings.search_provider === 'tavily' ? 'Higher quality, uses Tavily credits.' : 'Free, no API key required. May be rate-limited.'}
+          >
+            <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm">
+              {[['tavily', 'Tavily'], ['duckduckgo', 'DuckDuckGo']].map(([val, label]) => (
+                <button
+                  key={val}
+                  onClick={() => update('search_provider', val)}
+                  className={`flex-1 py-1.5 transition-colors ${
+                    settings.search_provider === val
+                      ? 'bg-blue-600 text-white font-medium'
+                      : 'text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          {/* Google AI Studio */}
+          <Field label="Google AI model" hint="Primary LLM — free at aistudio.google.com. Automatically falls back to 2.5 Flash → 2.0 Flash if unavailable.">
+            <select
+              value={settings.google_model}
+              onChange={e => update('google_model', e.target.value)}
+              className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white"
+            >
+              {GOOGLE_MODELS.map(m => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+          </Field>
+
+          <Field label="Google Search grounding" hint="Adds live web results on top of pre-injected search context.">
+            <label className="flex items-center gap-2 cursor-pointer mt-1">
+              <div
+                onClick={() => update('google_use_search', !settings.google_use_search)}
+                className={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                  settings.google_use_search ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                  settings.google_use_search ? 'translate-x-4' : 'translate-x-0'
+                }`} />
+              </div>
+              <span className="text-sm text-gray-700">
+                {settings.google_use_search ? 'Enabled' : 'Disabled'}
+              </span>
+            </label>
+          </Field>
+
+          {/* OpenRouter fallback */}
+          <Field label="OpenRouter fallback" hint="Used when GOOGLE_API_KEY is not set. Free tier only.">
+            <select
+              value={settings.openrouter_model}
+              onChange={e => update('openrouter_model', e.target.value)}
+              className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white"
+            >
+              {OPENROUTER_MODELS.map(m => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
           </Field>
 
           {/* Contact enrichment */}

@@ -14,6 +14,32 @@ def _get_client() -> TavilyClient:
     return _client
 
 
+def _run_ddg_search_raw(query: str, max_results: int = 5) -> list[dict]:
+    """DuckDuckGo search returning normalized {url, content, title} format."""
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        return [
+            {
+                "url": r.get("href", ""),
+                "title": r.get("title", ""),
+                "content": r.get("body", ""),
+            }
+            for r in results
+        ]
+    except Exception as e:
+        print(f"[search] DDG query failed: '{query}' — {e}")
+        return []
+
+
+def run_search(query: str, provider: str = "tavily", max_results: int = 5) -> list[dict]:
+    """Unified search dispatcher — returns [{url, title, content}]."""
+    if provider == "duckduckgo":
+        return _run_ddg_search_raw(query, max_results=max_results)
+    return _run_search(_get_client(), query)
+
+
 def _extract_keywords(thesis: str) -> tuple[str, str]:
     """
     Naively extract a sector keyword and geography keyword from the thesis.
@@ -61,9 +87,8 @@ def format_results(results: list[dict], query: str, max_chars_per_result: int = 
     return "\n".join(lines)
 
 
-def search_for_sector_brief(thesis: str) -> str:
+def search_for_sector_brief(thesis: str, provider: str = "tavily") -> str:
     sector, geo = _extract_keywords(thesis)
-    client = _get_client()
     queries = [
         f"{sector} software market size {geo} 2024 2025",
         f"{sector} SaaS private equity M&A acquisitions 2023 2024 2025",
@@ -73,29 +98,27 @@ def search_for_sector_brief(thesis: str) -> str:
         f"{sector} software acquisition strategic buyer {geo} 2023 2024 2025",
         f"{sector} SaaS exit multiple EV ARR comparable transaction",
     ]
-    blocks = [format_results(_run_search(client, q), q, max_chars_per_result=500) for q in queries]
+    blocks = [format_results(run_search(q, provider=provider), q, max_chars_per_result=500) for q in queries]
     return "\n\n".join(blocks)
 
 
-def search_for_conferences(thesis: str) -> str:
+def search_for_conferences(thesis: str, provider: str = "tavily") -> str:
     sector, _ = _extract_keywords(thesis)
-    client = _get_client()
     queries = [
         f"{sector} conference 2026",
         f"{sector} industry event Europe 2026",
         f"b2b tech {sector} summit 2026",
     ]
-    blocks = [format_results(_run_search(client, q), q) for q in queries]
+    blocks = [format_results(run_search(q, provider=provider), q) for q in queries]
     return "\n\n".join(blocks)
 
 
-def search_for_companies(thesis: str) -> str:
+def search_for_companies(thesis: str, provider: str = "tavily") -> str:
     sector, geo = _extract_keywords(thesis)
-    client = _get_client()
     queries = [
         f"{sector} software companies Europe",
         f"top {sector} SaaS vendors {geo}",
         f"{sector} startup Europe funding 2024 2025",
     ]
-    blocks = [format_results(_run_search(client, q), q) for q in queries]
+    blocks = [format_results(run_search(q, provider=provider), q) for q in queries]
     return "\n\n".join(blocks)
