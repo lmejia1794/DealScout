@@ -290,7 +290,7 @@ Do NOT include linkedin_url — omit that field entirely."""
     enrichment_enabled = _settings.get("contact_enrichment_enabled", True)
     if enrichment_enabled:
         from enrichment import enrich_contact
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
         _log(f"=== Contact Enrichment ({len(decision_makers)} decision makers in parallel) ===")
 
         def _enrich_one(dm):
@@ -312,14 +312,21 @@ Do NOT include linkedin_url — omit that field entirely."""
         contacts: dict = {}
         with ThreadPoolExecutor(max_workers=len(decision_makers) or 1) as pool:
             futures = {pool.submit(_enrich_one, dm): dm for dm in decision_makers}
-            for future in as_completed(futures, timeout=40):
-                try:
-                    dm, contact = future.result()
-                    contacts[id(dm)] = (dm, contact)
-                except Exception as e:
-                    dm = futures[future]
-                    _log(f"  Enrichment timed out for {dm.get('name', '?')}: {e}")
-                    contacts[id(dm)] = (dm, {"enrichment_notes": "Enrichment timed out"})
+            try:
+                for future in as_completed(futures, timeout=75):
+                    try:
+                        dm, contact = future.result()
+                        contacts[id(dm)] = (dm, contact)
+                    except Exception as e:
+                        dm = futures[future]
+                        _log(f"  Enrichment error for {dm.get('name', '?')}: {e}")
+                        contacts[id(dm)] = (dm, {"enrichment_notes": f"Enrichment error: {e}"})
+            except FuturesTimeout:
+                _log("  Contact enrichment timeout — returning partial results")
+                # Mark any unfinished DMs gracefully instead of crashing
+                for dm in decision_makers:
+                    if id(dm) not in contacts:
+                        contacts[id(dm)] = (dm, {"enrichment_notes": "Enrichment timed out"})
 
         for dm in decision_makers:
             _, contact = contacts.get(id(dm), (dm, {"enrichment_notes": "No result"}))
