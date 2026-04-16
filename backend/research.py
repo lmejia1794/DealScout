@@ -241,20 +241,27 @@ def _apply_grounding_citations(text: str, candidate) -> str:
       grounding_chunks  — the source pages (URI + title)
       grounding_supports — maps byte ranges in the response text to which chunks support them
 
-    We read those byte ranges and insert [SRC: url] immediately after each supported segment,
-    working back-to-front so earlier offsets are not shifted by later insertions.
+    Primary path: read byte ranges from grounding_supports and insert [SRC: url] markers
+    back-to-front so earlier offsets are not shifted by later insertions.
+
+    Fallback path: if grounding_supports is empty (e.g. gemini-2.5-flash omits it), scan
+    the text for Gemini's own [N] inline footnote markers and map them 1:1 to grounding_chunks.
+    This converts [1] → [SRC: chunk_0_url], [2] → [SRC: chunk_1_url], etc.  The footnote
+    markers are then NOT stripped by _strip_gemini_grounding_artifacts (which only strips bare
+    [N] patterns without a SRC: replacement).
 
     Falls back to returning the original text unchanged on any error.
     """
     try:
         gm = getattr(candidate, 'grounding_metadata', None)
         if not gm:
+            logger.debug("Grounding: no grounding_metadata on candidate")
             return text
 
         chunks = list(getattr(gm, 'grounding_chunks', None) or [])
         supports = list(getattr(gm, 'grounding_supports', None) or [])
-        if not chunks or not supports:
-            return text
+
+        logger.debug("Grounding: %d chunks, %d supports", len(chunks), len(supports))
 
         # Build index → URL mapping from grounding chunks.
         # vertexaisearch.cloud.google.com/grounding-api-redirect/... URLs are valid —
@@ -267,44 +274,72 @@ def _apply_grounding_citations(text: str, candidate) -> str:
                 if uri.startswith('http'):
                     url_map[i] = uri
 
+        logger.debug("Grounding: url_map has %d entries", len(url_map))
+
         if not url_map:
             return text
 
-        # Collect (end_byte_offset, url) for each grounding support.
-        # Segment offsets are byte offsets into the UTF-8-encoded response text.
-        encoded = text.encode('utf-8')
-        insertions: list = []
-        for support in supports:
-            seg = getattr(support, 'segment', None)
-            if not seg:
-                continue
-            end_idx = getattr(seg, 'end_index', None)
-            if end_idx is None:
-                continue
-            chunk_indices = list(getattr(support, 'grounding_chunk_indices', None) or [])
-            # Use the highest-confidence chunk (first in list) for the citation URL
-            url = next((url_map[i] for i in chunk_indices if i in url_map), None)
-            if url:
-                insertions.append((int(end_idx), url))
+        # --- Primary path: grounding_supports with byte-offset segments ---
+        if supports:
+            encoded = text.encode('utf-8')
+            insertions: list = []
+            for support in supports:
+                seg = getattr(support, 'segment', None)
+                if not seg:
+                    continue
+                end_idx = getattr(seg, 'end_index', None)
+                if end_idx is None:
+                    continue
+                chunk_indices = list(getattr(support, 'grounding_chunk_indices', None) or [])
+                # Use the highest-confidence chunk (first in list) for the citation URL
+                url = next((url_map[i] for i in chunk_indices if i in url_map), None)
+                if url:
+                    insertions.append((int(end_idx), url))
 
-        if not insertions:
-            return text
+            logger.debug("Grounding: %d insertions from grounding_supports", len(insertions))
 
-        # Deduplicate by position, then sort descending so we insert back-to-front
-        seen: set = set()
-        deduped = []
-        for pos, url in sorted(insertions, key=lambda x: x[0], reverse=True):
-            if pos not in seen:
-                seen.add(pos)
-                deduped.append((pos, url))
+            if insertions:
+                # Deduplicate by position, then sort descending so we insert back-to-front
+                seen: set = set()
+                deduped = []
+                for pos, url in sorted(insertions, key=lambda x: x[0], reverse=True):
+                    if pos not in seen:
+                        seen.add(pos)
+                        deduped.append((pos, url))
 
-        for pos, url in deduped:
-            marker = f' [SRC: {url}]'.encode('utf-8')
-            encoded = encoded[:pos] + marker + encoded[pos:]
+                for pos, url in deduped:
+                    marker = f' [SRC: {url}]'.encode('utf-8')
+                    encoded = encoded[:pos] + marker + encoded[pos:]
 
-        result = encoded.decode('utf-8', errors='replace')
-        logger.debug("Grounding: injected %d [SRC:] citations from grounding metadata", len(deduped))
-        return result
+                result = encoded.decode('utf-8', errors='replace')
+                logger.debug("Grounding: injected %d [SRC:] citations via byte-offset path", len(deduped))
+                logger.info("Google AI: grounding citations injected via byte-offset (%d markers)", len(deduped))
+                return result
+
+        # --- Fallback path: map Gemini's [N] inline footnote markers to chunk URLs ---
+        # gemini-2.5-flash (and thinking models) may omit grounding_supports but still
+        # embed [1], [2] markers in the text corresponding to grounding_chunks by index.
+        numeric_refs_found = re.findall(r'\[(\d+)\]', text)
+        logger.debug("Grounding: fallback path — found %d [N] markers in text: %s",
+                     len(numeric_refs_found), numeric_refs_found[:20])
+
+        if numeric_refs_found:
+            def _replace_ref(m):
+                n = int(m.group(1)) - 1  # convert 1-based marker to 0-based index
+                url = url_map.get(n)
+                if url:
+                    return f' [SRC: {url}]'
+                return ''  # remove marker with no matching chunk
+
+            new_text = re.sub(r'\[(\d+)\]', _replace_ref, text)
+            replaced = new_text.count('[SRC:')
+            if replaced:
+                logger.debug("Grounding: injected %d [SRC:] citations via [N] fallback path", replaced)
+                logger.info("Google AI: grounding citations injected via [N] fallback (%d markers)", replaced)
+                return new_text
+
+        logger.info("Google AI: no grounding citations injected (no supports, no [N] markers matched chunks)")
+        return text
 
     except Exception as exc:
         logger.debug("Grounding citation extraction failed: %s", exc)
@@ -418,11 +453,11 @@ def _call_google(prompt: str, max_tokens: int, use_search: bool = False, log_fn=
         try:
             candidate = response.candidates[0]
             if inject_grounding_citations:
-                # Prose mode: inject [SRC: url] markers inline
+                # Prose mode: inject [SRC: url] markers inline.
+                # _apply_grounding_citations logs its own info-level messages,
+                # so we just update text here.
                 text_with_citations = _apply_grounding_citations(text, candidate)
-                if text_with_citations != text:
-                    _log(f"Google AI: grounding citations injected ({text.count('[SRC:')} → {text_with_citations.count('[SRC:')} markers)")
-                    text = text_with_citations
+                text = text_with_citations
             if _grounding_chunks_collector is not None:
                 # JSON mode: collect chunk URLs for the verification layer instead
                 before = len(_grounding_chunks_collector)

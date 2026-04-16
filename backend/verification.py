@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import httpx
@@ -642,10 +644,12 @@ def _verify_entity_batch(
         return {k: {'status': 'pending', 'claim': v} for k, v in claims.items()}
 
     # Check call cap — only applies to Tavily (paid); DuckDuckGo is free, no cap needed
+    _cs_lock = call_state.get('_lock') if call_state else None
     if search_provider == 'tavily' and call_state is not None and TAVILY_MAX_CALLS > 0:
-        if call_state.get('count', 0) >= TAVILY_MAX_CALLS:
-            _log(f"  Tavily cap reached ({TAVILY_MAX_CALLS}) — skipping {entity_name}")
-            return {k: {'status': 'pending', 'citation_note': 'Tavily call limit reached for this run', 'claim': v} for k, v in claims.items()}
+        with (_cs_lock or threading.Lock()):
+            if call_state.get('count', 0) >= TAVILY_MAX_CALLS:
+                _log(f"  Tavily cap reached ({TAVILY_MAX_CALLS}) — skipping {entity_name}")
+                return {k: {'status': 'pending', 'citation_note': 'Tavily call limit reached for this run', 'claim': v} for k, v in claims.items()}
 
     claims_json = json.dumps(claims, indent=2)
     tavily_context = ""
@@ -707,7 +711,8 @@ corrected_value should be short and direct — it will be displayed inline as a 
     # --- Path B: Gemini native search (only when Gemini is the verifier) ---
     elif _verifier_uses_gemini_search():
         if call_state is not None:
-            call_state['count'] = call_state.get('count', 0) + 1
+            with (_cs_lock or threading.Lock()):
+                call_state['count'] = call_state.get('count', 0) + 1
         _log(f"  Verifier search #{call_state.get('count', '?') if call_state else '?'} (Gemini native): {search_query}")
         prompt = f"""You are a fact-checker. Use web search to find information about {entity_name} and verify the following claims.
 
@@ -742,7 +747,8 @@ corrected_value should be short and direct — it will be displayed inline as a 
             results = run_search(search_query, provider=search_provider)
             # Only track call count for Tavily (paid); DuckDuckGo is free
             if search_provider == 'tavily' and call_state is not None:
-                call_state['count'] = call_state.get('count', 0) + 1
+                with (_cs_lock or threading.Lock()):
+                    call_state['count'] = call_state.get('count', 0) + 1
             if results:
                 ctx_parts = [f"URL: {r.get('url', '')}\n{r.get('content', '')[:400]}" for r in results[:5]]
                 tavily_context = "\n\n".join(ctx_parts)
@@ -1095,20 +1101,28 @@ def verify_sector_brief(
     verified_claims = []
 
     if url_citations:
-        # --- Citation-first path ---
-        for cit in url_citations:
+        # --- Citation-first path — fetch all URLs in parallel ---
+        def _verify_one_citation(cit):
             claim_text = cit['claim_snippet']
-            _log(f">   Verifying: {claim_text[:70]}")
-            _log(f">   Citation URL: {cit['citation_url']}")
             result = _fetch_and_verify_citation(
                 url=cit['citation_url'],
                 claim=claim_text,
                 entity_name='sector brief',
                 log_fn=log_fn,
             )
-            icon = '✓' if result.get('status') == 'verified' else ('✗' if result.get('status') == 'contradicted' else '?')
-            _log(f">   {result.get('status')} {icon} (source: {result.get('source_url', '')})")
-            verified_claims.append({'claim': claim_text, 'verification': result})
+            return claim_text, result
+
+        with ThreadPoolExecutor(max_workers=min(len(url_citations), 8)) as pool:
+            futures = {pool.submit(_verify_one_citation, cit): cit for cit in url_citations}
+            for future in as_completed(futures):
+                try:
+                    claim_text, result = future.result()
+                    icon = '✓' if result.get('status') == 'verified' else ('✗' if result.get('status') == 'contradicted' else '?')
+                    _log(f">   {claim_text[:70]} → {result.get('status')} {icon}")
+                    verified_claims.append({'claim': claim_text, 'verification': result})
+                except Exception as e:
+                    cit = futures[future]
+                    _log(f">   Citation fetch failed: {e}")
 
         # Mark estimated / derived as inferred
         for cit in citations:
@@ -1372,41 +1386,94 @@ def verify_research(
     _log(f"=== Verification Pass ===")
     _log(f"  Search: {search_provider} ({'enabled' if use_tavily else 'disabled'}){cap_str} | ~{n_companies + n_confs + 1} calls max")
 
-    call_state = {'count': 0}
+    # Shared thread-safe call counter for Tavily cap enforcement
+    call_state = {'count': 0, '_lock': threading.Lock()}
 
-    _log(f"--- Verifying sector brief... (1/3) ---")
-    sector_verification = verify_sector_brief(
-        research_result['sector_brief'],
-        log_fn=log_fn,
-        use_tavily=use_tavily,
-        call_state=call_state,
-        search_provider=search_provider,
-    )
+    companies = research_result.get('companies', [])
+    conferences = research_result.get('conferences', [])
 
-    _log(f"--- Verifying {n_confs} conferences... (2/3) ---")
-    verified_conferences = []
-    for conf in research_result.get('conferences', []):
-        verified_conferences.append(verify_conference(
-            conf,
+    # Run sector brief, all companies, and all conferences in parallel.
+    # Each entity gets one search + one LLM call; running them concurrently cuts
+    # wall time from O(N) sequential to roughly O(1) — bounded by the slowest entity.
+    _log(f"--- Parallel verification: {n_confs} conferences + {n_companies} companies + sector brief ---")
+
+    sector_verification = None
+    verified_companies_map = {}   # index → result
+    verified_conferences_map = {} # index → result
+
+    def _run_sector_brief():
+        return verify_sector_brief(
+            research_result['sector_brief'],
             log_fn=log_fn,
             use_tavily=use_tavily,
-            existing_context=conferences_context,
             call_state=call_state,
             search_provider=search_provider,
-        ))
+        )
 
-    _log(f"--- Verifying {n_companies} companies... (3/3) ---")
-    verified_companies = []
-    for i, company in enumerate(research_result.get('companies', [])):
-        _log(f"  Company {i + 1}/{n_companies}: {company.get('name', '?')}")
-        verified_companies.append(verify_company(
+    def _run_company(idx, company):
+        return idx, verify_company(
             company,
             log_fn=log_fn,
             use_tavily=use_tavily,
             existing_context=companies_context,
             call_state=call_state,
             search_provider=search_provider,
-        ))
+        )
+
+    def _run_conference(idx, conf):
+        return idx, verify_conference(
+            conf,
+            log_fn=log_fn,
+            use_tavily=use_tavily,
+            existing_context=conferences_context,
+            call_state=call_state,
+            search_provider=search_provider,
+        )
+
+    n_workers = 1 + len(companies) + len(conferences)  # sector brief + each entity
+    with ThreadPoolExecutor(max_workers=max(n_workers, 1)) as pool:
+        futures = {}
+        futures['brief'] = pool.submit(_run_sector_brief)
+        for i, c in enumerate(companies):
+            futures[('company', i)] = pool.submit(_run_company, i, c)
+        for i, cf in enumerate(conferences):
+            futures[('conf', i)] = pool.submit(_run_conference, i, cf)
+
+        for future in as_completed(futures.values()):
+            key = next(k for k, f in futures.items() if f is future)
+            try:
+                result = future.result()
+                if key == 'brief':
+                    sector_verification = result
+                    _log("  Sector brief verification complete")
+                elif isinstance(key, tuple) and key[0] == 'company':
+                    idx, verified = result
+                    verified_companies_map[idx] = verified
+                    _log(f"  Company verified: {companies[idx].get('name', '?')}")
+                elif isinstance(key, tuple) and key[0] == 'conf':
+                    idx, verified = result
+                    verified_conferences_map[idx] = verified
+                    _log(f"  Conference verified: {conferences[idx].get('name', '?')}")
+            except Exception as e:
+                if key == 'brief':
+                    _log(f"  Sector brief verification failed: {e}")
+                    sector_verification = {'claims': [], 'overall_confidence': None}
+                elif isinstance(key, tuple) and key[0] == 'company':
+                    idx = key[1]
+                    _log(f"  Company verification failed ({companies[idx].get('name', '?')}): {e}")
+                    verified_companies_map[idx] = {
+                        'company': companies[idx], 'verifications': {}, 'overall_confidence': None
+                    }
+                elif isinstance(key, tuple) and key[0] == 'conf':
+                    idx = key[1]
+                    _log(f"  Conference verification failed ({conferences[idx].get('name', '?')}): {e}")
+                    verified_conferences_map[idx] = {
+                        'conference': conferences[idx], 'verifications': {}, 'overall_confidence': None
+                    }
+
+    # Restore original ordering
+    verified_companies = [verified_companies_map[i] for i in range(len(companies))]
+    verified_conferences = [verified_conferences_map[i] for i in range(len(conferences))]
 
     if search_provider == 'tavily':
         _log(f"=== Verification complete — {call_state['count']} Tavily calls used ===")

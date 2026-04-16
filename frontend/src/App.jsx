@@ -539,6 +539,7 @@ export default function App() {
           onDelete={handleDelete}
           onNew={handleNew}
         />
+
       </aside>
 
       {/* Main */}

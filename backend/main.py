@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import os
 import queue
 import threading
+import time
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -18,6 +20,53 @@ from comparables import generate_comparables
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Run logger — writes all log_fn messages to last_run.log, overwritten each run
+# ---------------------------------------------------------------------------
+
+_LOG_PATH = os.path.join(os.path.dirname(__file__), "last_run.log")
+_log_lock = threading.Lock()
+
+
+def _wrap_log_fn(inner_log_fn, run_label: str):
+    """
+    Wraps an existing log_fn so that every message is:
+    1. Written to last_run.log (opened in write mode — overwriting the previous run).
+    2. Forwarded to inner_log_fn (which feeds the SSE queue).
+
+    Returns (wrapped_log_fn, close_fn).  Call close_fn() when the run ends.
+    """
+    _file_handle = [None]
+
+    with _log_lock:
+        try:
+            fh = open(_LOG_PATH, "w", encoding="utf-8", buffering=1)
+            fh.write(f"=== DealScout run: {run_label} | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
+            _file_handle[0] = fh
+        except Exception as exc:
+            logger.warning("Could not open last_run.log: %s", exc)
+
+    def wrapped(msg: str):
+        fh = _file_handle[0]
+        if fh:
+            ts = time.strftime("%H:%M:%S")
+            try:
+                fh.write(f"[{ts}] {msg}\n")
+            except Exception:
+                pass
+        inner_log_fn(msg)
+
+    def close():
+        fh = _file_handle[0]
+        if fh:
+            try:
+                fh.write(f"\n=== run ended {time.strftime('%H:%M:%S')} ===\n")
+                fh.close()
+            except Exception:
+                pass
+
+    return wrapped, close
 
 app = FastAPI(title="DealScout API", version="1.0.0")
 
@@ -49,8 +98,10 @@ async def research(req: ResearchRequest):
     result_holder: dict = {}
 
     def run():
-        def log_fn(msg):
+        def _queue_log(msg):
             log_q.put({"type": "log", "message": msg})
+
+        log_fn, close_log = _wrap_log_fn(_queue_log, f"research: {req.thesis[:60]}")
 
         def phase_fn(phase, data):
             log_q.put({"type": "phase_result", "phase": phase, "data": data})
@@ -59,11 +110,14 @@ async def research(req: ResearchRequest):
             result = run_research(req.thesis, settings=req.settings, log_fn=log_fn, phase_fn=phase_fn)
             result_holder["data"] = result
         except RuntimeError as e:
+            log_fn(f"ERROR: {e}")
             result_holder["error"] = str(e)
         except Exception as e:
             logger.exception("Unexpected error in run_research")
+            log_fn(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
             result_holder["error"] = f"Unexpected server error: {type(e).__name__}: {e}"
         finally:
+            close_log()
             log_q.put(None)  # sentinel — pipeline finished
 
     thread = threading.Thread(target=run, daemon=True)
@@ -160,15 +214,19 @@ async def company_profile(req: ProfileRequest):
     result_holder: dict = {}
 
     def run():
-        def log_fn(msg):
+        def _queue_log(msg):
             log_q.put({"type": "log", "message": msg})
+        company_name = req.company.name if hasattr(req.company, 'name') else 'unknown'
+        log_fn, close_log = _wrap_log_fn(_queue_log, f"profile: {company_name}")
         try:
             data = generate_profile(req.company.model_dump(), req.thesis, log_fn=log_fn, settings=req.settings)
             result_holder["data"] = data
         except Exception as e:
             logger.exception("Error generating company profile")
+            log_fn(f"ERROR: {type(e).__name__}: {e}")
             result_holder["error"] = str(e)
         finally:
+            close_log()
             log_q.put(None)
 
     thread = threading.Thread(target=run, daemon=True)

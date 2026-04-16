@@ -24,3 +24,6 @@ node_modules/
 .idea/
 *.swp
 *.swo
+
+# Debug logs
+backend/last_run.log

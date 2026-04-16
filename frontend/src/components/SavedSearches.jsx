@@ -66,6 +66,35 @@ export default function SavedSearches({ searches, draft, onSelect, onDelete, onN
               </p>
             </li>
           ))}
+
+          {/* CRM Tracker — coming soon, anchored below oldest saved search */}
+          {searches.length > 0 && (
+            <li className="pt-2 border-t border-gray-100 mt-1">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="flex items-center gap-1.5">
+                  <svg className="w-3.5 h-3.5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
+                  </svg>
+                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Contact Tracker</span>
+                </div>
+                <span className="text-[9px] font-semibold bg-amber-100 text-amber-600 px-1.5 py-0.5 rounded-full uppercase tracking-wide">
+                  Soon
+                </span>
+              </div>
+              <div className="bg-gray-50 border border-dashed border-gray-200 rounded-lg px-3 py-2.5 space-y-1.5 opacity-60">
+                <p className="text-[11px] text-gray-500 leading-snug">
+                  Log calls, emails, and follow-ups against enriched decision maker contacts across all saved searches.
+                </p>
+                <div className="flex flex-wrap gap-1">
+                  {['Log call', 'Email sent', 'Follow-up', 'Meeting'].map(tag => (
+                    <span key={tag} className="text-[10px] bg-white border border-gray-200 text-gray-400 px-1.5 py-0.5 rounded-full">
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </li>
+          )}
         </ul>
       )}
     </div>
