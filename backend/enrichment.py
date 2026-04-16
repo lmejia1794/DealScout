@@ -195,8 +195,9 @@ def _method1_website(
 
         if not contact.get("email"):
             emails = _extract_emails_from_html(html)
-            window_emails = _EMAIL_RE.findall(window)
-            chosen = window_emails[0] if window_emails else (emails[0] if emails else None)
+            window_emails = [e for e in _EMAIL_RE.findall(window) if _EMAIL_RE.fullmatch(e)]
+            all_emails = [e for e in emails if _EMAIL_RE.fullmatch(e)]
+            chosen = window_emails[0] if window_emails else (all_emails[0] if all_emails else None)
             if chosen:
                 contact["email"] = chosen
                 contact["email_confidence"] = "high"
@@ -262,12 +263,16 @@ Search for:
 - Company filings or registry entries that list director contact details
 - Any public appearances where contact info was listed
 
+IMPORTANT: Only return an email if you found a complete, valid email address (e.g. john.smith@company.com).
+Do NOT guess or construct an email pattern. Do NOT return a partial address (e.g. "john" or "john.smith").
+If you cannot find a confirmed, complete email address, set email to null.
+
 Return ONLY a raw JSON object:
 {{
-  "email": "string or null",
-  "email_source_url": "string or null",
-  "phone": "string or null",
-  "phone_source_url": "string or null",
+  "email": "complete email address or null",
+  "email_source_url": "URL where email was found or null",
+  "phone": "phone number or null",
+  "phone_source_url": "URL where phone was found or null",
   "notes": "string or null"
 }}"""
 
@@ -282,12 +287,15 @@ Return ONLY a raw JSON object:
             if not isinstance(data, dict):
                 data = {}
 
-        if data.get("email"):
-            contact["email"] = data["email"]
+        raw_email = (data.get("email") or "").strip()
+        if raw_email and _EMAIL_RE.fullmatch(raw_email):
+            contact["email"] = raw_email
             contact["email_confidence"] = "medium"
             contact["email_source"] = "web_search"
             src = data.get("email_source_url", "")
             log_fn(f"  Method 3: Found email{' at ' + src if src else ''} (medium confidence)")
+        elif raw_email:
+            log_fn(f"  Method 3: Rejected malformed email '{raw_email}' (not a valid address)")
 
         if data.get("phone"):
             contact["phone"] = data["phone"]
