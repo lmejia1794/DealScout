@@ -267,10 +267,10 @@ function ProfileView({ company, profile, thesis, comparables, onClose }) {
 // ---------------------------------------------------------------------------
 // Modal shell
 // ---------------------------------------------------------------------------
-export default function CompanyModal({ company, thesis, comparables, onProfileLoaded, onClose }) {
-  const [phase, setPhase] = useState('loading') // loading | loaded | error
+export default function CompanyModal({ company, thesis, comparables, initialProfile, onProfileLoaded, onClose }) {
+  const [phase, setPhase] = useState(initialProfile ? 'loaded' : 'loading')
   const [logs, setLogs] = useState([])
-  const [profile, setProfile] = useState(null)
+  const [profile, setProfile] = useState(initialProfile || null)
   const [errorMsg, setErrorMsg] = useState('')
   const { settings } = useSettings()
 
@@ -321,8 +321,8 @@ export default function CompanyModal({ company, thesis, comparables, onProfileLo
   }, [company, thesis])
 
   useEffect(() => {
-    fetchProfile()
-  }, [fetchProfile])
+    if (!initialProfile) fetchProfile()
+  }, [fetchProfile, initialProfile])
 
   // Close on Escape
   useEffect(() => {

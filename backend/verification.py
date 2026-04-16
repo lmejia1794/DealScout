@@ -1488,3 +1488,260 @@ def verify_research(
         '_companies_context': companies_context,
         '_conferences_context': conferences_context,
     }
+
+
+# ---------------------------------------------------------------------------
+# Citation URL repair (post-generation, pre-verification)
+# ---------------------------------------------------------------------------
+
+_URL_CITATION_RE = re.compile(r'\[SRC:\s*(https?://[^\]]+)\]')
+
+
+def repair_sector_brief_citations(
+    text: str,
+    settings: dict,
+    log_fn=None,
+    max_repairs: int = 8,
+) -> tuple:
+    """
+    POST-GENERATION CITATION REPAIR
+
+    For every [SRC: https://...] marker in the sector brief:
+      1. HEAD-check all unique URLs in parallel.
+      2. For 404s / homepage-redirects: search the source domain for the claim
+         using the configured search provider (Tavily / DuckDuckGo).
+      3. Fetch the best candidate page and ask the verifier LLM whether the
+         claim is actually present there.
+      4. If verified → replace the broken URL inline in the returned text.
+
+    Returns (repaired_text, repair_log) where repair_log is a list of dicts
+    describing each repair attempt.  Runs safely inside a background thread.
+    """
+    from search import run_search
+    from urllib.parse import urlparse
+    from bs4 import BeautifulSoup
+
+    def _log(msg):
+        logger.info(msg)
+        if log_fn:
+            log_fn(msg)
+
+    # ------------------------------------------------------------------ #
+    # Step 1 – collect all URL citations with their preceding claim text  #
+    # ------------------------------------------------------------------ #
+
+    class _Ref:
+        __slots__ = ('url', 'claim')
+        def __init__(self, u, c):
+            self.url = u
+            self.claim = c
+
+    refs: list[_Ref] = []
+    for m in _URL_CITATION_RE.finditer(text):
+        url = m.group(1).strip()
+        # Grab the last sentence before the marker as the "claim"
+        start = max(0, m.start() - 300)
+        preceding = text[start:m.start()]
+        for sep in ('. ', '.\n', '!\n', '?\n', '\n\n'):
+            pos = preceding.rfind(sep)
+            if pos >= 0:
+                preceding = preceding[pos + len(sep):]
+                break
+        refs.append(_Ref(url, preceding.strip()[:150]))
+
+    if not refs:
+        return text, []
+
+    # ------------------------------------------------------------------ #
+    # Step 2 – HEAD-check all unique URLs in parallel                     #
+    # ------------------------------------------------------------------ #
+
+    def _is_broken(url: str) -> tuple:
+        """Returns (url, is_broken, reason)."""
+        try:
+            r = httpx.head(url, timeout=6, follow_redirects=True,
+                           headers={"User-Agent": _BROWSER_UA})
+            if r.status_code == 404:
+                return url, True, 'HTTP 404'
+            if r.status_code >= 400:
+                return url, True, f'HTTP {r.status_code}'
+            # Detect homepage-redirect: specific path collapsed to root
+            orig = urlparse(url)
+            final = urlparse(str(r.url))
+            if (
+                orig.path.rstrip('/') not in ('', '/')
+                and final.path.rstrip('/') in ('', '/')
+                and orig.netloc.lower().lstrip('www.') == final.netloc.lower().lstrip('www.')
+            ):
+                return url, True, 'Redirected to homepage (page missing)'
+            return url, False, ''
+        except httpx.TimeoutException:
+            return url, False, ''   # timeout → leave alone
+        except Exception:
+            return url, False, ''
+
+    unique_urls = list({r.url for r in refs})
+    broken_map: dict = {}  # url → reason
+    with ThreadPoolExecutor(max_workers=min(len(unique_urls), 15)) as pool:
+        for url, is_broken, reason in pool.map(_is_broken, unique_urls):
+            if is_broken:
+                broken_map[url] = reason
+
+    if not broken_map:
+        _log(f"Citation repair: all {len(unique_urls)} citation URL(s) are live — nothing to fix")
+        return text, []
+
+    _log(f"Citation repair: {len(broken_map)}/{len(unique_urls)} broken citation(s) — searching for replacements")
+
+    # ------------------------------------------------------------------ #
+    # Step 3 – for each broken URL, find and verify a replacement         #
+    # ------------------------------------------------------------------ #
+
+    search_provider = (settings or {}).get('search_provider', 'duckduckgo')
+    url_replacement: dict = {}   # broken_url → working_url | None
+    repair_log: list = []
+    repairs_attempted = 0
+
+    for broken_url, broken_reason in broken_map.items():
+        if repairs_attempted >= max_repairs:
+            break
+        repairs_attempted += 1
+
+        # Find claim for this URL (first occurrence)
+        ref = next((r for r in refs if r.url == broken_url), None)
+        if not ref:
+            url_replacement[broken_url] = None
+            continue
+
+        claim = ref.claim
+        domain = urlparse(broken_url).netloc or broken_url
+        record = {
+            'broken_url': broken_url,
+            'broken_reason': broken_reason,
+            'claim': claim,
+            'domain': domain,
+            'replacement_url': None,
+            'verdict': 'unverifiable',
+            'supporting_excerpt': None,
+        }
+
+        try:
+            query = f'site:{domain} {claim[:80]}'
+            _log(f"  Searching: {query[:90]}…")
+            results = run_search(query, provider=search_provider)
+
+            # Filter to same domain, exclude the known-broken URL
+            candidates = [
+                r for r in results
+                if r.get('url')
+                and domain in r.get('url', '')
+                and r.get('url') != broken_url
+            ][:3]
+
+            if not candidates:
+                _log(f"  No candidates found for {domain}")
+                url_replacement[broken_url] = None
+                repair_log.append(record)
+                continue
+
+            # Try candidates until one is verified
+            found = False
+            for candidate in candidates:
+                candidate_url = candidate.get('url', '')
+                if not candidate_url:
+                    continue
+
+                # Quick pre-filter: significant claim words in search snippet
+                snippet_text = (candidate.get('content', '') + ' ' + candidate.get('title', '')).lower()
+                claim_words = [w.lower() for w in claim.split() if len(w) > 4]
+                hits = sum(1 for w in claim_words if w in snippet_text)
+                if claim_words and hits < max(1, len(claim_words) // 4):
+                    continue   # snippet doesn't mention the claim at all
+
+                # Fetch the candidate page
+                try:
+                    page_resp = httpx.get(
+                        candidate_url, timeout=10, follow_redirects=True,
+                        headers={"User-Agent": _BROWSER_UA},
+                    )
+                    if page_resp.status_code >= 400:
+                        continue
+                    soup = BeautifulSoup(page_resp.text, "lxml")
+                    for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside"]):
+                        tag.decompose()
+                    body = (
+                        soup.find("article") or soup.find("main")
+                        or soup.find(attrs={"role": "main"})
+                        or soup.find(class_="content") or soup.find(id="content")
+                        or soup.body
+                    )
+                    if not body:
+                        continue
+                    page_text = re.sub(r"\s{2,}", " ", body.get_text(separator=" ", strip=True))[:3000]
+                except Exception:
+                    continue
+
+                if not page_text.strip():
+                    continue
+
+                # Ask the verifier LLM: is the claim on this page?
+                try:
+                    from research import _strip_json_fences as _sfences
+                    verify_prompt = (
+                        f'A sector-brief citation URL returned an error ({broken_reason}). '
+                        f'We found a candidate replacement page on the same domain.\n\n'
+                        f'Original claim: "{claim}"\n'
+                        f'Original (broken) URL: {broken_url}\n'
+                        f'Candidate URL: {candidate_url}\n\n'
+                        f'Page content (excerpt):\n{page_text}\n\n'
+                        f'Does the candidate page support the claim above?\n\n'
+                        f'Return ONLY a JSON object:\n'
+                        f'{{"verdict":"verified"|"contradicted"|"unverifiable",'
+                        f'"supporting_excerpt":"direct quote from page (max 100 chars) or null"}}'
+                    )
+                    raw = _call_verifier_llm(verify_prompt, max_tokens=200)
+                    parsed = json.loads(_sfences(raw))
+                    verdict = parsed.get('verdict', 'unverifiable')
+                    if verdict not in ('verified', 'contradicted', 'unverifiable'):
+                        verdict = 'unverifiable'
+                    excerpt = parsed.get('supporting_excerpt')
+                    _log(f"  {verdict}: {candidate_url}")
+
+                    if verdict == 'verified':
+                        url_replacement[broken_url] = candidate_url
+                        record['replacement_url'] = candidate_url
+                        record['verdict'] = verdict
+                        record['supporting_excerpt'] = excerpt
+                        found = True
+                        break
+                except Exception as e:
+                    _log(f"  LLM check failed for {candidate_url}: {e}")
+                    continue
+
+            if not found:
+                _log(f"  No verified replacement found for {broken_url}")
+                url_replacement[broken_url] = None
+
+        except Exception as e:
+            _log(f"  Repair search failed for {broken_url}: {e}")
+            url_replacement[broken_url] = None
+
+        repair_log.append(record)
+
+    # ------------------------------------------------------------------ #
+    # Step 4 – replace broken URLs in text                                #
+    # ------------------------------------------------------------------ #
+
+    repairs_made = sum(1 for v in url_replacement.values() if v)
+    if not repairs_made:
+        _log("Citation repair: no verified replacements found — text unchanged")
+        return text, repair_log
+
+    def _sub(m):
+        url = m.group(1).strip()
+        replacement = url_replacement.get(url)
+        return f'[SRC: {replacement}]' if replacement else m.group(0)
+
+    repaired = _URL_CITATION_RE.sub(_sub, text)
+    _log(f"Citation repair: replaced {repairs_made} broken URL(s) with verified alternatives")
+    return repaired, repair_log

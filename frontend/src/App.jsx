@@ -10,6 +10,7 @@ import CompanyModal from './components/CompanyModal'
 import ComparablesPanel from './components/ComparablesPanel'
 import ReportActionBar from './components/ReportActionBar'
 import { useSettings } from './components/SettingsContext'
+import { usePipeline } from './components/PipelineContext'
 import { API_BASE } from './config'
 
 const PHASES = [
@@ -20,7 +21,6 @@ const PHASES = [
 ]
 
 const LS_KEY = 'dealscout_searches'
-const SS_KEY = 'dealscout_session'
 
 function loadSaved() {
   try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]') }
@@ -31,18 +31,6 @@ function saveToDisk(searches) {
 }
 function truncate(str, n) {
   return str.length > n ? str.slice(0, n - 1) + '…' : str
-}
-
-function loadSession() {
-  try { return JSON.parse(sessionStorage.getItem(SS_KEY) || 'null') }
-  catch { return null }
-}
-function saveSession(data) {
-  try { sessionStorage.setItem(SS_KEY, JSON.stringify(data)) }
-  catch {} // ignore QuotaExceededError
-}
-function clearSession() {
-  try { sessionStorage.removeItem(SS_KEY) } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -57,17 +45,12 @@ const PIPELINE_STEPS = [
 ]
 
 function PipelineProgress({ logs, loading, onStop }) {
-  // Determine which step is active / complete based on log history
   const reachedPhases = PIPELINE_STEPS.map(s =>
     logs.some(l => l.includes(s.marker))
   )
-  // active = highest reached phase index
-  const activeIdx = reachedPhases.lastIndexOf(true)
-  // a phase is "done" if the next phase has been reached
   const isDone = (i) => reachedPhases[i + 1] === true || (!loading && reachedPhases[i])
   const isActive = (i) => !isDone(i) && reachedPhases[i]
 
-  // Latest non-phase log line for the ticker
   const latestLog = [...logs].reverse().find(l => !l.startsWith('===') && l !== '— stopped by user —') || ''
 
   return (
@@ -75,7 +58,6 @@ function PipelineProgress({ logs, loading, onStop }) {
       {/* Header band */}
       <div className="bg-[#0d1f2d] px-5 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          {/* Animated radar pulse */}
           <div className="relative w-7 h-7 shrink-0">
             <div className="absolute inset-0 rounded-full bg-emerald-500/20 animate-ping" />
             <div className="absolute inset-1 rounded-full bg-emerald-500/30 animate-ping [animation-delay:0.3s]" />
@@ -103,7 +85,6 @@ function PipelineProgress({ logs, loading, onStop }) {
             const pending = !done && !active
             return (
               <React.Fragment key={i}>
-                {/* Step node */}
                 <div className="flex flex-col items-center gap-1.5 min-w-[90px]">
                   <div className={`
                     w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-all duration-500
@@ -124,7 +105,6 @@ function PipelineProgress({ logs, loading, onStop }) {
                     {done && <span className="block text-[10px] font-normal text-emerald-500">done</span>}
                   </span>
                 </div>
-                {/* Connector line */}
                 {i < PIPELINE_STEPS.length - 1 && (
                   <div className="flex-1 h-0.5 mb-5 mx-1 rounded-full overflow-hidden bg-gray-100">
                     <div className={`h-full rounded-full transition-all duration-700 ${done ? 'w-full bg-emerald-400' : 'w-0 bg-blue-400'}`} />
@@ -250,186 +230,135 @@ function ConfidenceSummaryBar({ results, tavilyCallsUsed, tavilyMax }) {
 // App
 // ---------------------------------------------------------------------------
 export default function App() {
-  // Restore session state (survives navigation to /report and back)
-  const _session = loadSession()
-
-  const [results, setResults] = useState(_session?.results || null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
-  const [phaseLabel, setPhaseLabel] = useState(PHASES[0].label)
-  const [logs, setLogs] = useState([])
-  const [savedSearches, setSavedSearches] = useState(loadSaved)
-  const [currentThesis, setCurrentThesis] = useState(_session?.currentThesis || '')
-  const [modalCompany, setModalCompany] = useState(null)
-  const [comparables, setComparables] = useState(_session?.comparables || null)
-  const [selectedCompanies, setSelectedCompanies] = useState(_session?.selectedCompanies || [])
-  const [selectedConferences, setSelectedConferences] = useState(_session?.selectedConferences || [])
-  const [profiles, setProfiles] = useState(_session?.profiles || {})
-  const [preparingReport, setPreparingReport] = useState(false)
-  const [tavilyCallsUsed, setTavilyCallsUsed] = useState(0)
-  // Draft entry shown in left nav while research is in progress
-  const [currentDraft, setCurrentDraft] = useState(null)
-  const abortRef = useRef(null)
-  const navigate = useNavigate()
+  const { jobs, activeJobId, activeJob, addJob, cancelJob, selectJob, patchJobResults } = usePipeline()
   const { settings } = useSettings()
+  const navigate = useNavigate()
 
-  // Persist session to sessionStorage so state survives navigating to /report and back
-  useEffect(() => {
-    saveSession({ results, currentThesis, comparables, selectedCompanies, selectedConferences, profiles })
-  }, [results, currentThesis, comparables, selectedCompanies, selectedConferences, profiles])
+  // Persistent saved searches (localStorage)
+  const [savedSearches, setSavedSearches] = useState(loadSaved)
+  // Viewing a saved search from localStorage (separate from live pipeline jobs)
+  const [viewingSearch, setViewingSearch] = useState(null)
 
-  // Derive phase label from latest log line
+  // Per-session transient state — resets when active view changes
+  const [selectedCompanies, setSelectedCompanies] = useState([])
+  const [selectedConferences, setSelectedConferences] = useState([])
+  const [comparables, setComparables] = useState(null)
+  const [profiles, setProfiles] = useState({})
+  const [tavilyCallsUsed, setTavilyCallsUsed] = useState(0)
+
+  const [modalCompany, setModalCompany] = useState(null)
+  const [preparingReport, setPreparingReport] = useState(false)
+
+  // Track which job IDs have already been auto-saved to prevent duplicates
+  const savedJobIds = useRef(new Set())
+
+  // Reset per-session state when the active job or viewed search changes
+  const prevActiveJobId = useRef(activeJobId)
+  const prevViewingSearch = useRef(viewingSearch)
   useEffect(() => {
-    const lastLog = logs[logs.length - 1] || ''
-    for (const p of PHASES) {
-      if (lastLog.includes(p.marker)) {
-        setPhaseLabel(p.label)
-        return
+    const jobChanged = activeJobId !== prevActiveJobId.current
+    const searchChanged = viewingSearch !== prevViewingSearch.current
+    if (jobChanged || searchChanged) {
+      prevActiveJobId.current = activeJobId
+      prevViewingSearch.current = viewingSearch
+      setSelectedCompanies([])
+      setSelectedConferences([])
+      setComparables(null)
+      setProfiles({})
+      setTavilyCallsUsed(0)
+    }
+  }, [activeJobId, viewingSearch])
+
+  // Auto-save completed pipeline jobs to localStorage
+  useEffect(() => {
+    jobs.forEach(job => {
+      if (job.status === 'done' && job.results && !savedJobIds.current.has(job.id)) {
+        savedJobIds.current.add(job.id)
+        const entry = {
+          id: job.id,
+          label: truncate(job.thesis, 60),
+          thesis: job.thesis,
+          ...job.results,
+          comparables: null,
+          saved_at: job.completedAt || new Date().toISOString(),
+        }
+        setSavedSearches(prev => {
+          const updated = [entry, ...prev]
+          saveToDisk(updated)
+          return updated
+        })
       }
-    }
-  }, [logs])
+    })
+  }, [jobs])
 
-  const autoSave = (thesis, data, savedComparables) => {
-    const entry = {
-      id: crypto.randomUUID(),
-      label: truncate(thesis, 60),
-      thesis,
-      ...data,
-      comparables: savedComparables || null,
-      saved_at: new Date().toISOString(),
-    }
+  // Derive display state from active job (live) or viewed search (historical)
+  const displayThesis = activeJob?.thesis || viewingSearch?.thesis || ''
+  const displayResults = activeJob?.results || viewingSearch?.results || null
+  const displayLogs = activeJob?.logs || []
+  const displayLoading = !!activeJob && activeJob.status === 'running'
+  const displayError = activeJob?.status === 'error' ? activeJob.error : null
+
+  // Jobs currently running or queued — shown in sidebar
+  const activePipelineJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued')
+
+  const autoSaveComparables = (txns) => {
     setSavedSearches(prev => {
-      const updated = [entry, ...prev]
+      if (!prev.length) return prev
+      const updated = [{ ...prev[0], comparables: txns }, ...prev.slice(1)]
       saveToDisk(updated)
       return updated
     })
   }
 
-  const handleSearch = async (thesis) => {
-    if (abortRef.current) abortRef.current.abort()
-    const controller = new AbortController()
-    abortRef.current = controller
-
-    setCurrentThesis(thesis)
-    setResults(null)
-    setError(null)
-    setLogs([])
-    setPhaseLabel(PHASES[0].label)
-    setLoading(true)
-    setComparables(null)
-    setSelectedCompanies([])
-    setSelectedConferences([])
-    setProfiles({})
-
-    // Create draft entry for left nav so it's visible if user navigates away
-    const draftId = crypto.randomUUID()
-    setCurrentDraft({ id: draftId, label: truncate(thesis, 60), thesis, is_draft: true, saved_at: new Date().toISOString() })
-
-    try {
-      const response = await fetch(`${API_BASE}/api/research`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thesis, settings }),
-        signal: controller.signal,
-      })
-
-      if (!response.ok) {
-        const text = await response.text()
-        throw new Error(text || `HTTP ${response.status}`)
-      }
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop()
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          let event
-          try { event = JSON.parse(line.slice(6)) }
-          catch { continue }
-
-          if (event.type === 'log') {
-            setLogs(prev => [...prev, event.message])
-          } else if (event.type === 'phase_result') {
-            setResults(prev => ({ ...(prev || {}), ...event.data }))
-            setCurrentDraft(prev => prev ? { ...prev, ...event.data } : null)
-          } else if (event.type === 'result') {
-            setResults(event.data)
-            setCurrentDraft(null) // research complete — moves to savedSearches
-            autoSave(thesis, event.data, null)
-          } else if (event.type === 'error') {
-            setError(event.message)
-            setCurrentDraft(prev => prev ? { ...prev, is_error: true } : null)
-          }
-        }
-      }
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        setLogs(prev => [...prev, '— stopped by user —'])
-      } else {
-        setError(err.message || 'Something went wrong.')
-      }
-    } finally {
-      setLoading(false)
-    }
+  const handleSearch = (thesis) => {
+    setViewingSearch(null)
+    addJob(thesis, settings)
   }
 
   const handleNew = () => {
-    if (abortRef.current) abortRef.current.abort()
-    setResults(null)
-    setError(null)
-    setLogs([])
-    setCurrentThesis('')
-    setComparables(null)
-    setSelectedCompanies([])
-    setSelectedConferences([])
-    setProfiles({})
-    setTavilyCallsUsed(0)
-    setCurrentDraft(null)
-    clearSession()
+    // Don't abort anything — running pipelines continue in the queue
+    selectJob(null)
+    setViewingSearch(null)
   }
 
-  // Update a single verification field in results state (from on-demand verify)
   const handleUpdateVerification = (entityType, entityName, fieldName, newVerification) => {
-    setResults(prev => {
-      if (!prev) return prev
-      const listKey = entityType === 'company' ? 'companies' : 'conferences'
-      const itemKey = entityType === 'company' ? 'company' : 'conference'
-      const updated = (prev[listKey] || []).map(item => {
-        const raw = item?.[itemKey] || item
+    const listKey = entityType === 'company' ? 'companies' : 'conferences'
+    const applyUpdate = (results) => {
+      if (!results) return results
+      const updated = (results[listKey] || []).map(item => {
+        const raw = item?.company || item?.conference || item
         if (raw.name !== entityName) return item
-        const base = item?.[itemKey] ? item : { [itemKey]: item, verifications: {}, overall_confidence: null }
-        return {
-          ...base,
-          verifications: { ...base.verifications, [fieldName]: newVerification },
-        }
+        const base = item?.company ? item : { [entityType]: item, verifications: {}, overall_confidence: null }
+        return { ...base, verifications: { ...base.verifications, [fieldName]: newVerification } }
       })
-      return { ...prev, [listKey]: updated }
-    })
+      return { ...results, [listKey]: updated }
+    }
+
+    if (activeJob) {
+      patchJobResults(activeJob.id, applyUpdate)
+    } else if (viewingSearch) {
+      setViewingSearch(prev => prev ? { ...prev, results: applyUpdate(prev.results) } : prev)
+    }
   }
 
-  const handleSelect = (s) => {
-    setCurrentThesis(s.thesis)
-    // Support both new (sector_brief_verification) and old saved search shapes
-    setResults({
-      sector_brief: s.sector_brief,
-      sector_brief_verification: s.sector_brief_verification || null,
-      conferences: s.conferences,
-      companies: s.companies,
+  const handleSelectSavedSearch = (s) => {
+    selectJob(null)
+    setViewingSearch({
+      thesis: s.thesis,
+      results: {
+        sector_brief: s.sector_brief,
+        sector_brief_verification: s.sector_brief_verification || null,
+        conferences: s.conferences,
+        companies: s.companies,
+      },
+      comparables: s.comparables || null,
     })
     setComparables(s.comparables || null)
-    setError(null)
-    setLogs([])
-    setSelectedCompanies([])
-    setSelectedConferences([])
-    setProfiles({})
+  }
+
+  const handleSelectJob = (jobId) => {
+    setViewingSearch(null)
+    selectJob(jobId)
   }
 
   const handleDelete = (id) => {
@@ -442,13 +371,7 @@ export default function App() {
 
   const handleComparablesLoaded = (txns) => {
     setComparables(txns)
-    // Persist into the most recent saved search
-    setSavedSearches(prev => {
-      if (!prev.length) return prev
-      const updated = [{ ...prev[0], comparables: txns }, ...prev.slice(1)]
-      saveToDisk(updated)
-      return updated
-    })
+    autoSaveComparables(txns)
   }
 
   const toggleCompany = (company) => {
@@ -467,13 +390,12 @@ export default function App() {
     )
   }
 
-  // Fetch a profile silently (no UI) — used when building the report
   const fetchProfileSilent = async (company) => {
     try {
       const resp = await fetch(`${API_BASE}/api/company/profile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ company, thesis: currentThesis, settings }),
+        body: JSON.stringify({ company, thesis: displayThesis, settings }),
       })
       const reader = resp.body.getReader()
       const decoder = new TextDecoder()
@@ -509,8 +431,8 @@ export default function App() {
     setPreparingReport(false)
     navigate('/report', {
       state: {
-        thesis: currentThesis,
-        sectorBrief: results?.sector_brief || '',
+        thesis: displayThesis,
+        sectorBrief: displayResults?.sector_brief || '',
         selectedCompanies,
         selectedConferences,
         comparables: comparables || [],
@@ -534,85 +456,87 @@ export default function App() {
         </div>
         <SavedSearches
           searches={savedSearches}
-          draft={currentDraft}
-          onSelect={handleSelect}
+          pipelineJobs={activePipelineJobs}
+          activeJobId={activeJobId}
+          onSelectJob={handleSelectJob}
+          onCancelJob={cancelJob}
+          onSelect={handleSelectSavedSearch}
           onDelete={handleDelete}
           onNew={handleNew}
         />
-
       </aside>
 
       {/* Main */}
       <main className="flex-1 p-5 md:p-8 max-w-4xl mx-auto w-full pb-24">
         <SearchBar
           onSearch={handleSearch}
-          loading={loading}
-          hasResults={!!results}
-          currentThesis={currentThesis}
+          loading={displayLoading}
+          hasResults={!!displayResults}
+          currentThesis={displayThesis}
         />
 
         {/* Pipeline progress + logs */}
-        {(loading || logs.length > 0) && (
+        {(displayLoading || displayLogs.length > 0) && (
           <div className="mt-6 space-y-3">
-            {loading && (
+            {displayLoading && (
               <PipelineProgress
-                logs={logs}
-                loading={loading}
-                onStop={() => abortRef.current?.abort()}
+                logs={displayLogs}
+                loading={displayLoading}
+                onStop={() => activeJob && cancelJob(activeJob.id)}
               />
             )}
-            <LogPanel logs={logs} loading={loading} />
+            <LogPanel logs={displayLogs} loading={displayLoading} />
           </div>
         )}
 
         {/* Error */}
-        {error && !loading && (
+        {displayError && !displayLoading && (
           <div className="mt-6 bg-red-50 border border-red-200 rounded-xl p-5">
             <p className="text-sm text-red-700 font-medium">Research failed</p>
-            <p className="text-sm text-red-600 mt-1">{error}</p>
+            <p className="text-sm text-red-600 mt-1">{displayError}</p>
           </div>
         )}
 
         {/* Results — shown progressively as each phase completes */}
-        {results && (
+        {displayResults && (
           <div className="mt-8 space-y-8">
-            {!loading && (
+            {!displayLoading && (
               <ConfidenceSummaryBar
-                results={results}
+                results={displayResults}
                 tavilyCallsUsed={tavilyCallsUsed}
                 tavilyMax={settings.verification_tavily_max_calls || 20}
               />
             )}
-            {results.sector_brief && (
-              <SectorBrief content={results.sector_brief} verification={results.sector_brief_verification} />
+            {displayResults.sector_brief && (
+              <SectorBrief content={displayResults.sector_brief} verification={displayResults.sector_brief_verification} />
             )}
-            {results.conferences && (
+            {displayResults.conferences && (
               <ConferenceGrid
-                conferences={results.conferences}
+                conferences={displayResults.conferences}
                 selectedConferences={selectedConferences}
                 onToggleConference={toggleConference}
-                conferencesContext={results._conferences_context || ''}
+                conferencesContext={displayResults._conferences_context || ''}
                 onUpdateVerification={(name, field, v) => handleUpdateVerification('conference', name, field, v)}
                 sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
                 onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
               />
             )}
-            {results.companies && (
+            {displayResults.companies && (
               <CompanyList
-                companies={results.companies}
+                companies={displayResults.companies}
                 onViewProfile={setModalCompany}
                 selectedCompanies={selectedCompanies}
                 onToggleCompany={toggleCompany}
-                companiesContext={results._companies_context || ''}
+                companiesContext={displayResults._companies_context || ''}
                 onUpdateVerification={(name, field, v) => handleUpdateVerification('company', name, field, v)}
                 sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
                 onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
               />
             )}
-            {!loading && (
+            {!displayLoading && (
               <ComparablesPanel
-                thesis={currentThesis}
-                sectorBrief={results.sector_brief}
+                thesis={displayThesis}
+                sectorBrief={displayResults.sector_brief}
                 transactions={comparables}
                 onLoaded={handleComparablesLoaded}
               />
@@ -625,8 +549,9 @@ export default function App() {
       {modalCompany && (
         <CompanyModal
           company={modalCompany}
-          thesis={currentThesis}
+          thesis={displayThesis}
           comparables={comparables}
+          initialProfile={profiles[modalCompany.name] || null}
           onProfileLoaded={(name, profile) =>
             setProfiles(prev => ({ ...prev, [name]: profile }))
           }

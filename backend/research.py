@@ -587,6 +587,13 @@ def _call_openrouter(model: str, prompt: str, max_tokens: int, use_web_search: b
     content = resp.choices[0].message.content
     if content is None:
         raise RuntimeError(f"OpenRouter returned no content for model {model} (finish_reason={resp.choices[0].finish_reason})")
+
+    # Reasoning models (Nemotron Ultra, DeepSeek R1, QwQ, Qwen3, etc.) emit
+    # chain-of-thought inside <think>…</think> blocks.  Browsers render unknown
+    # HTML tags as inline text, so the raw reasoning leaks into the UI.
+    # Strip these blocks entirely — only the final answer should reach the caller.
+    content = re.sub(r'<think(?:ing)?>[\s\S]*?</think(?:ing)?>', '', content, flags=re.IGNORECASE).strip()
+
     return content
 
 
@@ -1206,6 +1213,24 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
     if phase_fn:
         phase_fn("sector_brief", {"sector_brief": sector_brief})
 
+    # Start citation repair in background while Phases 2 & 3 run.
+    # Repairs broken [SRC: url] citations by searching the source domain and
+    # verifying the replacement with the cross-provider verifier LLM.
+    # Results are joined after Phase 3 and re-streamed if any URLs were fixed.
+    import threading as _threading
+    _repair_result: dict = {"text": sector_brief}
+    _repair_thread = None
+    if citations_enabled and '[SRC:' in sector_brief:
+        from verification import repair_sector_brief_citations as _repair_fn
+        def _run_repair():
+            try:
+                repaired, _ = _repair_fn(sector_brief, settings, log_fn=log_fn)
+                _repair_result["text"] = repaired
+            except Exception as _e:
+                _log(f"Citation repair failed: {_e}")
+        _repair_thread = _threading.Thread(target=_run_repair, daemon=True)
+        _repair_thread.start()
+
     _log("=== Phase 2: Conferences ===")
     conferences_context = ""
     try:
@@ -1228,6 +1253,18 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
         companies = []
     if phase_fn:
         phase_fn("companies", {"companies": companies})
+
+    # Join citation repair (it ran in parallel with Phases 2 & 3).
+    # If any URLs were fixed, re-stream the updated sector brief so the
+    # frontend replaces the one with broken links.
+    if _repair_thread is not None:
+        _repair_thread.join(timeout=90)   # cap wait at 90s
+        repaired_brief = _repair_result["text"]
+        if repaired_brief != sector_brief:
+            sector_brief = repaired_brief
+            _log("Citation repair: re-streaming sector brief with repaired URLs")
+            if phase_fn:
+                phase_fn("sector_brief", {"sector_brief": sector_brief})
 
     _log("=== Research complete ===")
     raw_result = {
