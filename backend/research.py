@@ -906,8 +906,28 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
         result = _strip_gemini_grounding_artifacts(
             _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=False, settings=settings)
         )
-        if not _brief_looks_valid(result):
-            _log(f"WARNING: retry also produced short brief ({len(result.strip())} chars) — returning as-is")
+        if not _brief_looks_valid(result) and _google_available():
+            # Both flash-3 attempts failed — escalate to gemini-2.5-flash
+            current_model = (settings or {}).get("google_model", "")
+            if "2.5" not in current_model:
+                _log(
+                    f"WARNING: gemini-3-flash produced short brief ({len(result.strip())} chars) "
+                    f"— escalating to gemini-2.5-flash"
+                )
+                fallback_settings = {**(settings or {}), "google_model": "gemini-2.5-flash"}
+                result_25 = _strip_gemini_grounding_artifacts(
+                    _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=True, settings=fallback_settings)
+                )
+                if _brief_looks_valid(result_25):
+                    result = result_25
+                    _log("gemini-2.5-flash escalation succeeded")
+                else:
+                    _log(f"WARNING: gemini-2.5-flash also short ({len(result_25.strip())} chars) — keeping best result")
+                    # Keep whichever is longer
+                    if len(result_25.strip()) > len(result.strip()):
+                        result = result_25
+            else:
+                _log(f"WARNING: retry also produced short brief ({len(result.strip())} chars) — returning as-is")
 
     # Guard: if citations were requested but still none appear after grounding metadata
     # extraction, the model produced no grounding supports at all (can happen when
@@ -922,6 +942,17 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
         if '[SRC:' in citation_retry and _brief_looks_valid(citation_retry):
             result = citation_retry
             _log("Citation retry succeeded")
+        elif _google_available() and "2.5" not in (settings or {}).get("google_model", ""):
+            _log("Citation retry failed — escalating to gemini-2.5-flash for citation compliance")
+            fallback_settings = {**(settings or {}), "google_model": "gemini-2.5-flash"}
+            citation_retry_25 = _strip_gemini_grounding_artifacts(
+                _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=True, settings=fallback_settings)
+            )
+            if '[SRC:' in citation_retry_25 and _brief_looks_valid(citation_retry_25):
+                result = citation_retry_25
+                _log("gemini-2.5-flash citation escalation succeeded")
+            else:
+                _log("gemini-2.5-flash citation escalation also produced no [SRC:] markers — returning as-is")
         else:
             _log("Citation retry also produced no [SRC:] markers — returning as-is")
 
