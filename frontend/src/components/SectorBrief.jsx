@@ -19,16 +19,22 @@ function processCitations(text) {
     source = source.trim()
     if (source.toLowerCase() === 'model_inference') return ''
     if (source.toLowerCase() === 'estimated') return ''
-    if (source.startsWith('http://') || source.startsWith('https://')) {
-      if (!urlToIndex[source]) {
-        refCounter++
-        urlToIndex[source] = refCounter
-        citations.push({ index: refCounter, url: source, isReal: true })
+
+    // Split by comma to handle multi-URL citations the model may emit
+    const parts = source.split(/,\s*/)
+    const refs = []
+    for (const part of parts) {
+      const url = part.trim()
+      if (url.startsWith('http://') || url.startsWith('https://')) {
+        if (!urlToIndex[url]) {
+          refCounter++
+          urlToIndex[url] = refCounter
+          citations.push({ index: refCounter, url, isReal: true })
+        }
+        refs.push(` [${urlToIndex[url]}](${url})`)
       }
-      // Use plain number — the `a` component applies consistent superscript styling
-      return ` [${urlToIndex[source]}](${source})`
     }
-    return ''
+    return refs.join('')
   })
 
   return { processed, citations }
