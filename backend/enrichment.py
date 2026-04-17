@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Optional
 
 import httpx
@@ -239,12 +239,15 @@ def _method1_website(
     page_results: dict[str, Optional[str]] = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         future_to_url = {pool.submit(_fetch_page, url): url for url in pages}
-        for future in as_completed(future_to_url, timeout=8):
-            url = future_to_url[future]
-            try:
-                page_results[url] = future.result()
-            except Exception:
-                page_results[url] = None
+        try:
+            for future in as_completed(future_to_url, timeout=8):
+                url = future_to_url[future]
+                try:
+                    page_results[url] = future.result()
+                except Exception:
+                    page_results[url] = None
+        except FuturesTimeoutError:
+            log_fn("  Method 1: Page fetch timed out — using partial results")
 
     # Process pages in priority order (team → contact → about → homepage)
     for page_url in pages:
