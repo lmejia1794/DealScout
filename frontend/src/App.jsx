@@ -21,6 +21,7 @@ const PHASES = [
 ]
 
 const LS_KEY = 'dealscout_searches'
+const PROFILES_LS_KEY = 'dealscout_profiles'
 
 function loadSaved() {
   try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]') }
@@ -28,6 +29,13 @@ function loadSaved() {
 }
 function saveToDisk(searches) {
   localStorage.setItem(LS_KEY, JSON.stringify(searches))
+}
+function loadAllProfiles() {
+  try { return JSON.parse(localStorage.getItem(PROFILES_LS_KEY) || '{}') }
+  catch { return {} }
+}
+function saveAllProfiles(data) {
+  localStorage.setItem(PROFILES_LS_KEY, JSON.stringify(data))
 }
 function truncate(str, n) {
   return str.length > n ? str.slice(0, n - 1) + '…' : str
@@ -251,6 +259,20 @@ export default function App() {
 
   // Track which job IDs have already been auto-saved to prevent duplicates
   const savedJobIds = useRef(new Set())
+  // Persistent profile cache: { thesis: { companyName: profile } }
+  const allCachedProfilesRef = useRef(loadAllProfiles())
+  // Keep a ref to jobs so view-change effect can look up thesis without it as a dep
+  const jobsRef = useRef(jobs)
+  useEffect(() => { jobsRef.current = jobs }, [jobs])
+
+  // Load cached profiles for the initial active view on mount
+  useEffect(() => {
+    const thesis = viewingSearch?.thesis || jobsRef.current.find(j => j.id === activeJobId)?.thesis || ''
+    if (thesis) {
+      const cached = allCachedProfilesRef.current[thesis] || {}
+      if (Object.keys(cached).length > 0) setProfiles(cached)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reset per-session state when the active job or viewed search changes
   const prevActiveJobId = useRef(activeJobId)
@@ -264,8 +286,10 @@ export default function App() {
       setSelectedCompanies([])
       setSelectedConferences([])
       setComparables(null)
-      setProfiles({})
       setTavilyCallsUsed(0)
+      // Load cached profiles for the new view's thesis
+      const newThesis = viewingSearch?.thesis || jobsRef.current.find(j => j.id === activeJobId)?.thesis || ''
+      setProfiles(allCachedProfilesRef.current[newThesis] || {})
     }
   }, [activeJobId, viewingSearch])
 
@@ -284,7 +308,10 @@ export default function App() {
           saved_at: job.completedAt || new Date().toISOString(),
         }
         setSavedSearches(prev => {
-          const updated = [entry, ...prev]
+          const exists = prev.some(s => s.thesis === entry.thesis)
+          const updated = exists
+            ? prev.map(s => s.thesis === entry.thesis ? { ...s, ...entry } : s)
+            : [entry, ...prev]
           saveToDisk(updated)
           return updated
         })
@@ -615,9 +642,16 @@ export default function App() {
           thesis={displayThesis}
           comparables={comparables}
           initialProfile={profiles[modalCompany.name] || null}
-          onProfileLoaded={(name, profile) =>
-            setProfiles(prev => ({ ...prev, [name]: profile }))
-          }
+          onProfileLoaded={(name, profile) => {
+            setProfiles(prev => {
+              const updated = { ...prev, [name]: profile }
+              const all = allCachedProfilesRef.current
+              all[displayThesis] = { ...(all[displayThesis] || {}), [name]: profile }
+              allCachedProfilesRef.current = all
+              saveAllProfiles(all)
+              return updated
+            })
+          }}
           onClose={handleModalClose}
         />
       )}
