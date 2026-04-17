@@ -1,6 +1,7 @@
 import React from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 import LlmBadge from './LlmBadge'
+import CompanyLogo from './CompanyLogo'
 
 const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
 
@@ -138,6 +139,7 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
           <input type="checkbox" checked={selected} onChange={onToggleSelect}
             className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 cursor-pointer shrink-0"
             onClick={e => e.stopPropagation()} />
+          <CompanyLogo website={company.website} name={company.name} size="md" />
           <div>
             <h3 className="font-semibold text-gray-900">{flag} {company.name}</h3>
             <p className="text-xs text-gray-500 mt-0.5">{location}</p>

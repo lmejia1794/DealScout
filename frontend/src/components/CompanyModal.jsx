@@ -5,6 +5,7 @@ import ServiceMap from './ServiceMap'
 import DecisionMakers from './DecisionMakers'
 import OutreachDraft from './OutreachDraft'
 import ComparablesPanel from './ComparablesPanel'
+import CompanyLogo from './CompanyLogo'
 import { useSettings } from './SettingsContext'
 
 // Reuse the same MD_COMPONENTS styling from SectorBrief
@@ -222,14 +223,7 @@ function ProfileView({ company, profile, thesis, comparables, onClose }) {
         </button>
         <div className="flex items-start justify-between pr-8">
           <div className="flex items-start gap-4">
-            {profile.logo_url && (
-              <img
-                src={profile.logo_url}
-                alt={`${company.name} logo`}
-                className="h-10 w-auto object-contain rounded bg-white/10 p-1 shrink-0"
-                onError={(e) => { e.target.style.display = 'none' }}
-              />
-            )}
+            <CompanyLogo website={company.website} name={company.name} size="lg" />
             <div>
               <h2 className="text-2xl font-bold text-white">{company.name}</h2>
               <div className="flex flex-wrap gap-2 mt-2">
