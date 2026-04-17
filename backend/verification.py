@@ -950,6 +950,112 @@ def verify_company(
 
 
 # ---------------------------------------------------------------------------
+# Conference website scrape — extract/verify date & location from the page
+# ---------------------------------------------------------------------------
+
+def _scrape_conference_date_location(
+    url: str,
+    name: str,
+    expected_date: str,
+    expected_location: str,
+    log_fn=None,
+) -> Optional[dict]:
+    """
+    Fetch the conference homepage and ask the verifier LLM to confirm or
+    correct the date and location from the live page text.
+    Returns a verification dict on success, None on any failure.
+    """
+    from bs4 import BeautifulSoup
+
+    def _log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    try:
+        resp = httpx.get(url, timeout=10, follow_redirects=True, headers={"User-Agent": _BROWSER_UA})
+        if resp.status_code >= 400:
+            return None
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        content = (
+            soup.find("article") or soup.find("main")
+            or soup.find(attrs={"role": "main"})
+            or soup.find(class_="content") or soup.find(id="content")
+            or soup.body
+        )
+        if not content:
+            return None
+        raw = content.get_text(separator=" ", strip=True)
+        page_text = re.sub(r"\s{2,}", " ", raw)[:CITATION_FETCH_MAX_CHARS]
+        if len(page_text) < 50:
+            return None
+
+    except Exception as e:
+        _log(f"    website scrape error: {e}")
+        return None
+
+    claim = f"{name} takes place on {expected_date} in {expected_location}"
+    prompt = f"""You are verifying a conference's date and location from its official website.
+
+Conference: {name}
+Expected date: {expected_date}
+Expected location: {expected_location}
+
+Website text (first portion):
+{page_text}
+
+Find the actual date and location on this page.
+Return ONLY a JSON object:
+{{
+  "verdict": "verified" | "contradicted" | "unverifiable",
+  "actual_date": "date found on page, or null if not found",
+  "actual_location": "city or venue found on page, or null if not found",
+  "corrected_value": "corrected 'date · location' string if contradicted, null otherwise",
+  "excerpt": "brief supporting quote from the page, max 80 chars, or null"
+}}
+
+verdict=verified: page confirms the expected date AND location.
+verdict=contradicted: page shows a clearly different date or location.
+verdict=unverifiable: date/location not clearly stated on the page."""
+
+    try:
+        raw_llm = _call_verifier_llm(prompt, max_tokens=200, use_search=False)
+        from research import _strip_json_fences, _escape_control_chars
+        cleaned = _escape_control_chars(_strip_json_fences(raw_llm))
+        try:
+            data = json.loads(cleaned)
+        except Exception:
+            from json_repair import repair_json
+            data = repair_json(cleaned, return_objects=True)
+            if not isinstance(data, dict):
+                return None
+
+        verdict = data.get("verdict", "unverifiable")
+        if verdict not in ("verified", "contradicted", "unverifiable"):
+            verdict = "unverifiable"
+
+        result: dict = {"status": verdict, "source_url": url, "claim": claim}
+
+        if verdict == "contradicted" and data.get("corrected_value"):
+            result["corrected_value"] = data["corrected_value"]
+            actual = f"{data.get('actual_date', '?')} · {data.get('actual_location', '?')}"
+            result["source_snippet"] = data.get("excerpt") or f"Page shows: {actual}"
+            result["citation_note"] = "Date/location differs from generated value — corrected from official website"
+        elif verdict == "verified":
+            result["source_snippet"] = data.get("excerpt") or "Confirmed on official website"
+        else:
+            result["citation_note"] = "Date/location not clearly stated on website homepage"
+
+        return result
+
+    except Exception as e:
+        _log(f"    website scrape LLM error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Conference verification
 # ---------------------------------------------------------------------------
 
@@ -989,8 +1095,19 @@ def verify_conference(
 
     verifications = {}
 
-    # Website: if missing, search for the conference homepage
-    if not conference.get('website'):
+    # Website: check existing URL; search if missing or dead
+    if conference.get('website'):
+        live_status = _check_website_live(conference['website'])
+        if live_status == 'contradicted':
+            _log(f"    website: 404/dead → searching for replacement")
+            found_url = _find_website(name, clean_location or '', log_fn=log_fn, is_conference=True, search_provider=search_provider)
+            if found_url:
+                conference['website'] = found_url
+                _log(f"    website: replaced → {found_url}")
+            else:
+                conference['website'] = None
+                _log(f"    website: no replacement found")
+    else:
         found_url = _find_website(name, clean_location or '', log_fn=log_fn, is_conference=True, search_provider=search_provider)
         if found_url:
             conference['website'] = found_url
@@ -1008,7 +1125,7 @@ def verify_conference(
 
     batch_claims = {}
 
-    # date_location: citation-first if a URL was embedded in date or location
+    # date_location: try citation URL first, then scrape website, fall back to batch
     if clean_date or clean_location:
         dl_claim = f'{name} is taking place in {clean_date} in {clean_location}'
         if dl_citation_type == 'url' and dl_citation_url:
@@ -1018,6 +1135,17 @@ def verify_conference(
                 name, log_fn, use_tavily, existing_context, call_state, search_provider)
             icon = '✓' if verifications['date_location'].get('status') == 'verified' else '~'
             _log(f"    date_location: {verifications['date_location'].get('status')} {icon}")
+        elif conference.get('website'):
+            _log(f"    date_location: scraping website → {conference['website']}")
+            scraped = _scrape_conference_date_location(
+                conference['website'], name, clean_date, clean_location, log_fn=log_fn)
+            if scraped and scraped.get('status') in ('verified', 'contradicted'):
+                verifications['date_location'] = scraped
+                icon = '✓' if scraped['status'] == 'verified' else '✗'
+                _log(f"    date_location: {scraped['status']} {icon} (scraped from website)")
+            else:
+                _log(f"    date_location: scrape inconclusive → falling back to batch")
+                batch_claims['date_location'] = dl_claim
         else:
             batch_claims['date_location'] = dl_claim
 
@@ -1614,6 +1742,29 @@ def repair_sector_brief_citations(
             continue
 
         claim = ref.claim
+
+        # Gemini grounding redirect URLs (vertexaisearch.cloud.google.com) are
+        # short-lived tokens. Follow the redirect to get the real source page;
+        # if it's still live use it directly, otherwise skip — searching
+        # site:vertexaisearch.cloud.google.com never returns results.
+        if 'vertexaisearch.cloud.google.com' in broken_url:
+            try:
+                rr = httpx.get(broken_url, timeout=8, follow_redirects=True,
+                               headers={"User-Agent": _BROWSER_UA})
+                dest = str(rr.url)
+                if 'vertexaisearch.cloud.google.com' not in dest and rr.status_code < 400:
+                    _log(f"  vertexai redirect resolved → {dest}")
+                    url_replacement[broken_url] = dest
+                    repair_log.append({'broken_url': broken_url, 'replacement_url': dest,
+                                       'verdict': 'redirect_resolved'})
+                    continue
+            except Exception:
+                pass
+            _log(f"  vertexai redirect expired/unresolvable — skipping")
+            url_replacement[broken_url] = None
+            repair_log.append({'broken_url': broken_url, 'verdict': 'vertexai_unresolvable'})
+            continue
+
         domain = urlparse(broken_url).netloc or broken_url
         record = {
             'broken_url': broken_url,

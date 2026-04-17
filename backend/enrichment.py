@@ -54,9 +54,36 @@ _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 def _empty_contact():
     return {
         "email": None, "email_confidence": None, "email_source": None,
+        "email_alternatives": None,
         "phone": None, "phone_confidence": None, "phone_source": None,
         "enrichment_notes": None,
     }
+
+
+def _resolve_email_candidates(contact: dict, candidates: list, log_fn) -> None:
+    """
+    Pick a winner from collected email candidates.
+    High/medium → single primary. Multiple low → surface all as alternatives.
+    """
+    if not candidates:
+        return
+    high_med = [c for c in candidates if c.get("confidence") in ("high", "medium")]
+    low = [c for c in candidates if c.get("confidence") == "low"]
+    if high_med:
+        best = high_med[0]
+        contact["email"] = best["email"]
+        contact["email_confidence"] = best["confidence"]
+        contact["email_source"] = best["source"]
+    elif len(low) > 1:
+        contact["email"] = None
+        contact["email_confidence"] = None
+        contact["email_source"] = None
+        contact["email_alternatives"] = low
+        log_fn(f"  Enrichment: {len(low)} low-confidence candidates — surfacing all")
+    elif len(low) == 1:
+        contact["email"] = low[0]["email"]
+        contact["email_confidence"] = low[0]["confidence"]
+        contact["email_source"] = low[0]["source"]
 
 
 def _is_complete(c: dict) -> bool:
@@ -143,6 +170,46 @@ def _email_candidates(first: str, last: str, domain: str) -> list:
         f"{fi}{l}@{domain}",
         f"{l}@{domain}",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Method 0 — PDL (People Data Labs) — LinkedIn URL only on free tier
+# ---------------------------------------------------------------------------
+
+def _query_pdl(name: str, company_name: str, log_fn=None) -> Optional[str]:
+    """
+    Look up a person's LinkedIn URL via PDL Person Enrichment API.
+    Free tier: 100 lookups/month. Returns linkedin_url string or None.
+    """
+    api_key = os.getenv("PDL_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        params = {
+            "name": name,
+            "company": company_name,
+            "pretty": "false",
+        }
+        resp = httpx.get(
+            "https://api.peopledatalabs.com/v5/person/enrich",
+            params=params,
+            headers={"X-Api-Key": api_key, "User-Agent": "DealScout/1.0"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            linkedin = data.get("data", {}).get("linkedin_url") or data.get("linkedin_url")
+            if linkedin:
+                if log_fn:
+                    log_fn(f"  PDL: LinkedIn URL found for {name}")
+                return linkedin if linkedin.startswith("http") else f"https://{linkedin}"
+        elif resp.status_code == 404:
+            pass  # no match — not an error
+        else:
+            logger.debug("PDL HTTP %s for %s", resp.status_code, name)
+    except Exception as exc:
+        logger.debug("PDL lookup failed for %s: %s", name, exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +361,20 @@ Return ONLY a raw JSON object:
             contact["email_source"] = "web_search"
             src = data.get("email_source_url", "")
             log_fn(f"  Method 3: Found email{' at ' + src if src else ''} (medium confidence)")
+        elif raw_email and '@' not in raw_email and '.' in raw_email and ' ' not in raw_email and company_website:
+            # Partial email like "christian.heidl" — complete with company domain
+            dm = re.search(r"https?://(?:www\.)?([^/]+)", company_website)
+            if dm:
+                completed = f"{raw_email}@{dm.group(1)}"
+                if _EMAIL_RE.fullmatch(completed):
+                    contact["email"] = completed
+                    contact["email_confidence"] = "low"
+                    contact["email_source"] = "web_search_completed"
+                    log_fn(f"  Method 3: Completed partial email '{raw_email}' → '{completed}' (low confidence)")
+                else:
+                    log_fn(f"  Method 3: Rejected malformed email '{raw_email}' (not a valid address)")
+            else:
+                log_fn(f"  Method 3: Rejected malformed email '{raw_email}' (not a valid address)")
         elif raw_email:
             log_fn(f"  Method 3: Rejected malformed email '{raw_email}' (not a valid address)")
 
@@ -330,6 +411,7 @@ def enrich_contact(
     company_website: Optional[str],
     company_country: Optional[str] = None,
     log_fn=None,
+    pdl_enabled: bool = True,
 ) -> dict:
     """
     Attempt to find email + phone for a decision maker using 3 methods.
@@ -356,36 +438,47 @@ def enrich_contact(
             if m:
                 domain = m.group(1)
 
+        email_candidates = []  # {email, confidence, source} — resolved at end
+
+        # --- Method 0: PDL — LinkedIn URL (authoritative over LLM-inferred) ---
+        if pdl_enabled:
+            pdl_linkedin = _query_pdl(name, company_name, _log)
+            if pdl_linkedin:
+                contact["linkedin_url"] = pdl_linkedin  # promoted to dm level by profile.py
+
         # --- Method 1: Website scraping ---
         m1 = _method1_website(last_name, company_website, country_iso, _log)
-        contact.update({k: v for k, v in m1.items() if v is not None})
+        if m1.get("email"):
+            email_candidates.append({"email": m1["email"], "confidence": m1.get("email_confidence"), "source": m1.get("email_source")})
+        for k in ("phone", "phone_confidence", "phone_source"):
+            if m1.get(k) is not None:
+                contact[k] = m1[k]
 
-        if _is_complete(contact):
-            _log(f"  Enrichment complete — email: {contact.get('email_confidence')}, phone: {contact.get('phone_confidence')}")
+        # Early exit: website found both email (high) and phone (high) — no alternatives needed
+        if email_candidates and email_candidates[0]["confidence"] == "high" and contact.get("phone_confidence") == "high":
+            contact["email"] = email_candidates[0]["email"]
+            contact["email_confidence"] = email_candidates[0]["confidence"]
+            contact["email_source"] = email_candidates[0]["source"]
+            _log(f"  Enrichment complete — email: high, phone: high")
             return contact
 
-        # --- Method 2: Email pattern (instant — no SMTP, just generate the most likely pattern) ---
-        if not contact.get("email") and domain and first_name and last_name:
-            m2 = _method2_pattern(first_name, last_name, domain, _log)
-            contact.update({k: v for k, v in m2.items() if v is not None and not contact.get(k)})
+        # --- Method 2: Email pattern (instant) — skip if already have high/medium candidate ---
+        if not any(c["confidence"] in ("high", "medium") for c in email_candidates):
+            if domain and first_name and last_name:
+                m2 = _method2_pattern(first_name, last_name, domain, _log)
+                if m2.get("email"):
+                    email_candidates.append({"email": m2["email"], "confidence": m2.get("email_confidence"), "source": m2.get("email_source")})
 
-        if _is_complete(contact):
-            _log(f"  Enrichment complete — email: {contact.get('email_confidence')}, phone: {contact.get('phone_confidence')}")
-            return contact
-
-        # --- Method 3: Gemini web search (if anything still missing at low confidence or absent) ---
-        email_ok = contact.get("email") and contact.get("email_confidence") in ("high", "medium")
+        # --- Method 3: Gemini web search (if anything still missing at high/medium confidence) ---
+        email_ok = any(c["confidence"] in ("high", "medium") for c in email_candidates)
         phone_ok = contact.get("phone") and contact.get("phone_confidence") in ("high", "medium")
 
         if not email_ok or not phone_ok:
             m3 = _method3_web_search(name, title, company_name, company_website, _log)
-            # Upgrade if: no email yet, OR current email is only a low-confidence pattern
-            if m3.get("email") and (
-                not contact.get("email") or contact.get("email_confidence") == "low"
-            ):
-                contact["email"] = m3["email"]
-                contact["email_confidence"] = m3.get("email_confidence")
-                contact["email_source"] = m3.get("email_source")
+            if m3.get("email"):
+                existing_emails = {c["email"].lower() for c in email_candidates}
+                if m3["email"].lower() not in existing_emails:
+                    email_candidates.append({"email": m3["email"], "confidence": m3.get("email_confidence"), "source": m3.get("email_source")})
             if not contact.get("phone") and m3.get("phone"):
                 contact["phone"] = m3["phone"]
                 contact["phone_confidence"] = m3.get("phone_confidence")
@@ -394,12 +487,18 @@ def enrich_contact(
                 existing = contact.get("enrichment_notes") or ""
                 contact["enrichment_notes"] = (existing + " | " + m3["enrichment_notes"]).strip(" | ")
 
-        # Summarise
-        e_conf = contact.get("email_confidence") or "none"
-        p_conf = contact.get("phone_confidence") or "none"
-        _log(f"  Enrichment complete — email: {e_conf}, phone: {p_conf}")
+        # --- Resolve email candidates ---
+        _resolve_email_candidates(contact, email_candidates, _log)
 
-        if not contact.get("email") and not contact.get("phone"):
+        # Summarise
+        if contact.get("email_alternatives"):
+            _log(f"  Enrichment complete — email: {len(contact['email_alternatives'])} low-confidence candidates, phone: {contact.get('phone_confidence') or 'none'}")
+        else:
+            e_conf = contact.get("email_confidence") or "none"
+            p_conf = contact.get("phone_confidence") or "none"
+            _log(f"  Enrichment complete — email: {e_conf}, phone: {p_conf}")
+
+        if not contact.get("email") and not contact.get("email_alternatives") and not contact.get("phone"):
             contact["enrichment_notes"] = "No contact info found via automated methods"
 
         return contact

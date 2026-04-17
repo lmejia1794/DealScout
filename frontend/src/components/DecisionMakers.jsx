@@ -27,8 +27,9 @@ function sourceLabel(source) {
   const map = {
     website: 'Found on website',
     smtp_verified: 'SMTP verified',
-    pattern_unverified: 'Pattern (unverified)',
+    pattern_unverified: 'Pattern',
     web_search: 'Web search',
+    web_search_completed: 'Completed from web',
   }
   return map[source] || source || ''
 }
@@ -73,7 +74,7 @@ export default function DecisionMakers({ decisionMakers = [] }) {
               <p className="text-xs text-gray-400 italic">{dm.notes}</p>
             )}
 
-            {/* Email row */}
+            {/* Email row — single confident address */}
             {contact.email && (
               <div className="flex flex-wrap items-center gap-1.5 text-xs">
                 <a href={`mailto:${contact.email}`} className="text-blue-600 hover:underline font-mono">
@@ -83,6 +84,24 @@ export default function DecisionMakers({ decisionMakers = [] }) {
                 {contact.email_source && (
                   <span className="text-gray-400">{sourceLabel(contact.email_source)}</span>
                 )}
+              </div>
+            )}
+
+            {/* Email alternatives — multiple low-confidence candidates */}
+            {!contact.email && contact.email_alternatives?.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-[10px] text-gray-400 uppercase tracking-wide font-medium">Possible addresses</p>
+                {contact.email_alternatives.map((alt, ai) => (
+                  <div key={ai} className="flex flex-wrap items-center gap-1.5 text-xs">
+                    <a href={`mailto:${alt.email}`} className="text-blue-600 hover:underline font-mono">
+                      {alt.email}
+                    </a>
+                    <ConfidenceBadge level={alt.confidence} />
+                    {alt.source && (
+                      <span className="text-gray-400">{sourceLabel(alt.source)}</span>
+                    )}
+                  </div>
+                ))}
               </div>
             )}
 
@@ -100,7 +119,7 @@ export default function DecisionMakers({ decisionMakers = [] }) {
             )}
 
             {/* Enrichment notes (only when no contact found) */}
-            {!contact.email && !contact.phone && contact.enrichment_notes && (
+            {!contact.email && !contact.email_alternatives?.length && !contact.phone && contact.enrichment_notes && (
               <p className="text-[11px] text-gray-400 italic">{contact.enrichment_notes}</p>
             )}
 

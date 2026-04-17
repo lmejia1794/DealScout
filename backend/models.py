@@ -12,6 +12,13 @@ class TestRequest(BaseModel):
     step: Literal["sector_brief", "conferences", "companies"] = "sector_brief"
 
 
+class StepRequest(BaseModel):
+    step: Literal["sector_brief", "conferences", "companies"]
+    thesis: str
+    sector_brief: str = ""
+    settings: Optional[dict] = None
+
+
 class Conference(BaseModel):
     name: str
     date: str
@@ -52,6 +59,7 @@ class ContactInfo(BaseModel):
     email: Optional[str] = None
     email_confidence: Optional[str] = None   # "high" | "medium" | "low"
     email_source: Optional[str] = None       # "website" | "smtp_verified" | "pattern_unverified" | "web_search"
+    email_alternatives: Optional[list] = None  # [{email, confidence, source}] when multiple low-confidence candidates
     phone: Optional[str] = None
     phone_confidence: Optional[str] = None
     phone_source: Optional[str] = None
@@ -72,9 +80,9 @@ class CompanyProfile(BaseModel):
     recent_news: str               # markdown
     competitive_positioning: str   # markdown
     fit_assessment: str            # markdown
-    hq_country: str                # full English country name e.g. "Germany"
-    service_countries: list[str]   # full English country names including HQ
-    decision_makers: list[DecisionMaker]
+    hq_country: Optional[str] = None
+    service_countries: Optional[list[str]] = None
+    decision_makers: list[DecisionMaker] = []
 
 
 class ProfileRequest(BaseModel):
@@ -197,3 +205,6 @@ class SettingsModel(BaseModel):
     verification_tavily_enabled: bool = True
     verification_citations_enabled: bool = True
     verification_tavily_max_calls: int = 20
+    registry_enrichment_enabled: bool = True
+    news_enrichment_enabled: bool = True
+    pdl_enrichment_enabled: bool = True

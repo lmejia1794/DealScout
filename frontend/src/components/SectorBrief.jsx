@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import VerificationBadge from './VerificationBadge'
+import LlmBadge from './LlmBadge'
 
 // ---------------------------------------------------------------------------
 // Citation processing — converts [SRC: ...] markers into numbered refs
@@ -277,7 +278,7 @@ function VerificationSummary({ verification }) {
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
-export default function SectorBrief({ content, verification }) {
+export default function SectorBrief({ content, verification, llmMeta, regenerating, onRegenerate }) {
   const [collapsed, setCollapsed] = useState(false)
 
   const rawText = normalize(content)
@@ -300,8 +301,22 @@ export default function SectorBrief({ content, verification }) {
     <div className="bg-white border border-gray-200 rounded-xl shadow-sm">
       <div className="flex justify-between items-center px-6 py-4 cursor-pointer hover:bg-gray-50 transition-colors"
         onClick={() => setCollapsed(!collapsed)}>
-        <h2 className="text-lg font-bold text-gray-800">Sector Brief</h2>
-        <button className="text-gray-400 hover:text-gray-600 text-sm font-medium">
+        <div className="flex items-center gap-2 flex-wrap">
+          <h2 className="text-lg font-bold text-gray-800">Sector Brief</h2>
+          <LlmBadge meta={llmMeta} />
+          {onRegenerate && (
+            <button
+              onClick={e => { e.stopPropagation(); onRegenerate() }}
+              disabled={regenerating}
+              className="inline-flex items-center gap-1 text-xs text-gray-400 hover:text-gray-700 border border-gray-200 rounded-md px-2 py-0.5 bg-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {regenerating
+                ? <><span className="w-3 h-3 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" /> Regenerating…</>
+                : '↻ Regenerate'}
+            </button>
+          )}
+        </div>
+        <button className="text-gray-400 hover:text-gray-600 text-sm font-medium shrink-0">
           {collapsed ? 'Expand ▾' : 'Collapse ▴'}
         </button>
       </div>

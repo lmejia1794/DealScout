@@ -16,8 +16,20 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from datetime import date
+
+# Thread-local LLM meta — records the last backend+model used on each thread.
+# Safe because research, verification, and citation-repair each run on their own thread.
+_thread_llm_meta = threading.local()
+
+def _get_last_llm_meta() -> dict:
+    return {
+        "backend": getattr(_thread_llm_meta, "backend", None),
+        "model":   getattr(_thread_llm_meta, "model",   None),
+        "search":  getattr(_thread_llm_meta, "search",  False),
+    }
 
 from google import genai
 from google.genai import types as genai_types
@@ -36,7 +48,7 @@ SYSTEM_PROMPT = (
 )
 TEMPERATURE = 0.2
 JSON_TOKENS = 12000
-BRIEF_TOKENS = 6000  # explicit large limit — avoids Ollama misinterpreting num_predict=-1
+BRIEF_TOKENS = 6000
 
 # Maximum characters of Tavily web context to inject per prompt.
 # Set WEB_CTX_MAX=0 to disable the cap entirely (useful when the Ollama server
@@ -468,6 +480,10 @@ def _call_google(prompt: str, max_tokens: int, use_search: bool = False, log_fn=
         except Exception:
             pass  # grounding extraction is best-effort; original text is still valid
 
+    _thread_llm_meta.backend = "google"
+    _thread_llm_meta.model   = model_name
+    _thread_llm_meta.search  = use_search
+    _log(f"LLM: Google AI · {model_name}{' · search' if use_search else ''}")
     _log(f"Google AI: {len(text)} chars, model={model_name}, search={use_search}")
     return text
 
@@ -597,11 +613,62 @@ def _call_openrouter(model: str, prompt: str, max_tokens: int, use_web_search: b
     return content
 
 
+def _call_groq(prompt: str, max_tokens: int, log_fn=None) -> str:
+    """
+    Call Groq API — free tier, much faster than OpenRouter free models.
+    Uses Llama 3.3 70B by default. Relies on Tavily/DuckDuckGo context
+    already injected into the prompt — no separate search integration needed.
+    """
+    from groq import Groq
+
+    def _log(msg):
+        logger.info(msg)
+        if log_fn:
+            log_fn(msg)
+
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set")
+
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    client = Groq(api_key=api_key)
+
+    # Free tier hard limit: 12,000 tokens per request (prompt + completion).
+    # Estimate prompt tokens, reduce completion budget first, then truncate prompt.
+    _GROQ_TPM_CAP = 11500  # conservative buffer
+    effective_max = max_tokens if max_tokens > 0 else 8192
+    est_prompt_tokens = (len(SYSTEM_PROMPT) + len(prompt)) // 4
+    if est_prompt_tokens + effective_max > _GROQ_TPM_CAP:
+        effective_max = max(500, _GROQ_TPM_CAP - est_prompt_tokens)
+    if est_prompt_tokens > _GROQ_TPM_CAP - 500:
+        prompt = prompt[:((_GROQ_TPM_CAP - 500) * 4)]
+        effective_max = 500
+        _log("Groq: prompt truncated to fit 12k TPM limit")
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=effective_max,
+    )
+    content = response.choices[0].message.content
+    _thread_llm_meta.backend = "groq"
+    _thread_llm_meta.model   = model
+    _thread_llm_meta.search  = False
+    _log(f"LLM: Groq · {model}")
+    _log(f"Groq: response={len(content)} chars, model={model}")
+    return content
+
+
 def _call_llm(prompt: str, max_tokens: int, log_fn=None, use_search: bool = False, settings: dict = None, inject_grounding_citations: bool = True, _grounding_chunks_collector: list = None) -> str:
     """
     Routing priority:
       1. Google AI Studio (Gemini) — primary, free, native web search via grounding
-      2. OpenRouter (Llama 3.3 70B free) — fallback if GOOGLE_API_KEY missing or call fails
+      2. Groq (Llama 3.3 70B) — fast free fallback
+      3. OpenRouter (Llama 3.3 70B free) — slower free fallback
     use_search: enables Grounding with Google Search for Google AI calls.
     """
     def _log(msg):
@@ -638,9 +705,19 @@ def _call_llm(prompt: str, max_tokens: int, log_fn=None, use_search: bool = Fals
                 msg = f"Google AI ({gmodel}) failed: {e}"
                 _log(msg)
                 failures.append(msg)
-        _log("All Google models failed — falling back to OpenRouter")
+        _log("All Google models failed — falling back to Groq")
 
-    # --- Fallback 1: OpenRouter (cascade: configured model → llama3 backstop) ---
+    # --- Fallback 1: Groq (fast free tier) ---
+    if os.getenv("GROQ_API_KEY", ""):
+        try:
+            _log("Using Groq fallback (Llama 3.3 70B)")
+            return _call_groq(prompt, max_tokens, log_fn=log_fn)
+        except Exception as e:
+            msg = f"Groq failed: {e}"
+            _log(msg)
+            failures.append(msg)
+
+    # --- Fallback 2: OpenRouter (cascade: configured model → llama3 backstop) ---
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
     if openrouter_key:
         _OR_BACKSTOP = "meta-llama/llama-3.3-70b-instruct:free"
@@ -652,14 +729,19 @@ def _call_llm(prompt: str, max_tokens: int, log_fn=None, use_search: bool = Fals
         for or_model in or_cascade:
             try:
                 _log(f"Using OpenRouter: {or_model}")
-                return _call_openrouter(or_model, prompt, max_tokens)
+                result = _call_openrouter(or_model, prompt, max_tokens)
+                _thread_llm_meta.backend = "openrouter"
+                _thread_llm_meta.model   = or_model
+                _thread_llm_meta.search  = False
+                _log(f"LLM: OpenRouter · {or_model}")
+                return result
             except Exception as e:
                 msg = f"OpenRouter ({or_model}) failed: {e}"
                 _log(msg)
                 failures.append(msg)
         _log("All OpenRouter models failed")
 
-    detail = "; ".join(failures) if failures else "no backends configured (set GOOGLE_API_KEY or OPENROUTER_API_KEY)"
+    detail = "; ".join(failures) if failures else "no backends configured (set GOOGLE_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY)"
     raise RuntimeError(f"All AI backends failed ({detail})")
 
 
@@ -774,6 +856,36 @@ def _call_json(prompt: str, log_fn=None, use_search: bool = False, settings: dic
 # Step 1 — Sector Brief
 # ---------------------------------------------------------------------------
 
+def _truncate_at_repetition(text: str) -> str:
+    """
+    Detect and remove self-repetition in the sector brief.
+
+    Gemini sometimes loops when it approaches max_tokens: it finishes (or
+    partially finishes) the last section, then immediately restarts the entire
+    brief inline — producing `?## Market Definition & Scope...` embedded in
+    the last list item.
+
+    Strategy: scan for any `## Heading` pattern (block-level or inline).
+    If the same heading appears a second time, truncate just before it.
+    Handles inline occurrences like `?##` with no preceding newline.
+    """
+    pattern = re.compile(r'##\s+([^\n]+)')
+    seen: dict = {}
+    for m in pattern.finditer(text):
+        # Strip inline [SRC: ...] citations (which may contain # in URL fragments)
+        # before normalization so citation text doesn't affect heading identity.
+        raw = re.sub(r'\s*\[SRC:[^\]]+\]', '', m.group(1))
+        heading = re.sub(r'\s+', ' ', raw).strip().rstrip(':').lower()
+        if len(heading) < 4:
+            continue
+        if heading in seen:
+            truncated = text[:m.start()].rstrip()
+            if len(truncated) > 1500:
+                return truncated
+        seen[heading] = m.start()
+    return text
+
+
 def _strip_gemini_grounding_artifacts(text: str) -> str:
     """
     Remove artifacts that Gemini appends when Google Search grounding is active:
@@ -800,6 +912,8 @@ def _strip_gemini_grounding_artifacts(text: str) -> str:
     # Strip inline numbered footnote markers [1] … [999].
     # Only strip bare numbers — [SRC: ...] markers contain a colon and are preserved.
     text = re.sub(r'\[\d+\]', '', text)
+    # Remove self-repetition (Gemini loop artifact near max_tokens)
+    text = _truncate_at_repetition(text)
     return text.strip()
 
 
@@ -810,7 +924,7 @@ def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", cit
             log_fn(msg)
 
     settings = settings or {}
-    search_provider = settings.get("search_provider", "tavily")
+    search_provider = settings.get("search_provider", "duckduckgo")
 
     if _google_available():
         # Gemini has native grounding — skip pre-injection, it will search itself
@@ -901,9 +1015,13 @@ Use ## for each section heading exactly as shown above. Write in clear, direct l
 IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the output in a JSON object or array, do NOT use code fences."""
     _log(f"Prompt size: {len(prompt)} chars (~{len(prompt)//4} tokens estimated)")
     result = _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=True, settings=settings)
+    raw_len_before = len(result)
     # Strip Gemini grounding artifacts (SOURCES section + [N] footnote markers)
-    # before any validity or citation checks so they don't skew length/section counts.
+    # and self-repetition (loop artifact near max_tokens).
     result = _strip_gemini_grounding_artifacts(result)
+    if len(result) < raw_len_before - 200:
+        _log(f"Post-processing: stripped {raw_len_before - len(result)} chars of artifacts/repetition "
+             f"({raw_len_before} → {len(result)})")
 
     # Guard: if the model returned JSON instead of markdown, extract the text values
     stripped = result.strip()
@@ -1013,7 +1131,7 @@ def generate_conferences(thesis: str, sector_brief: str, log_fn=None, extra_cont
             log_fn(msg)
 
     settings = settings or {}
-    search_provider = settings.get("search_provider", "tavily")
+    search_provider = settings.get("search_provider", "duckduckgo")
 
     _raw_conferences_context = ""
     if _google_available():
@@ -1085,7 +1203,7 @@ def generate_companies(thesis: str, sector_brief: str, log_fn=None, extra_contex
             log_fn(msg)
 
     settings = settings or {}
-    search_provider = settings.get("search_provider", "tavily")
+    search_provider = settings.get("search_provider", "duckduckgo")
 
     _raw_companies_context = ""
     if _google_available():
@@ -1108,7 +1226,14 @@ def generate_companies(thesis: str, sector_brief: str, log_fn=None, extra_contex
         _log(f"Extracted size constraints from thesis — injecting into prompt")
     _log("Calling LLM for company universe...")
 
-    prompt = f"""Investment thesis: {thesis}
+    prompt = f"""IMPORTANT — data hierarchy:
+Your output will be post-processed against authoritative company registries.
+Fields like founding year, legal name, and website will be overwritten by registry
+data where a strong match is found. Focus your effort on fields registries cannot
+provide: fit_score, fit_rationale, description, signals, estimated_arr, ownership.
+Do not pad confidence on founding year or legal name — if uncertain, leave null.
+
+Investment thesis: {thesis}
 
 {size_constraints + chr(10) if size_constraints else ""}Sector brief context:
 {sector_brief}
@@ -1175,6 +1300,59 @@ Sort the array by fit_score descending before returning."""
 
 
 # ---------------------------------------------------------------------------
+# Registry override pass
+# ---------------------------------------------------------------------------
+
+def _apply_registry_overrides(companies: list, settings: dict, log_fn=None) -> list:
+    """
+    Query registries for each company and overwrite LLM-inferred fields where
+    a high-confidence match is found. Registry data is authoritative.
+    """
+    from registries import enrich_company
+
+    def _log(msg):
+        logger.info(msg)
+        if log_fn:
+            log_fn(msg)
+
+    registry_enabled = settings.get("registry_enrichment_enabled", True)
+    news_enabled = settings.get("news_enrichment_enabled", True)
+
+    enriched = []
+    for company in companies:
+        name = company.get("name", "")
+        country = company.get("country")
+        website = company.get("website")
+
+        try:
+            enrichment = enrich_company(name, country, website, log_fn=log_fn)
+        except Exception as exc:
+            _log(f"  Registry enrichment failed for {name}: {exc}")
+            enriched.append(company)
+            continue
+
+        reg = enrichment.get("best_registry") if registry_enabled else None
+
+        if reg:
+            date = reg.get("incorporated_on") or reg.get("inception_year")
+            if date:
+                company["founded"] = str(date)[:4]
+                company["_founded_source"] = reg["source"]
+            if not company.get("website") and reg.get("website"):
+                company["website"] = reg["website"]
+            company["_registry_status"] = reg.get("status", "")
+            company["_registry_source"] = reg["source"]
+            _log(f"  Registry override applied for {name} via {reg['source']}")
+
+        company["_news"] = enrichment.get("news", []) if news_enabled else []
+        company["_logo_url"] = enrichment.get("logo_url")
+
+        enriched.append(company)
+
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
@@ -1210,6 +1388,7 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
 
     _log("=== Phase 1: Sector Brief ===")
     sector_brief = generate_sector_brief(thesis, log_fn=log_fn, extra_context=source_context, citations_enabled=citations_enabled, settings=settings)
+    sector_brief_meta = _get_last_llm_meta()
     if phase_fn:
         phase_fn("sector_brief", {"sector_brief": sector_brief})
 
@@ -1239,6 +1418,7 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
     except (ValueError, json.JSONDecodeError) as e:
         _log(f"ERROR: Conference generation failed — {e}")
         conferences = []
+    conferences_meta = _get_last_llm_meta()
     if phase_fn:
         phase_fn("conferences", {"conferences": conferences})
 
@@ -1251,8 +1431,16 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
     except (ValueError, json.JSONDecodeError) as e:
         _log(f"ERROR: Company generation failed — {e}")
         companies = []
+    companies_meta = _get_last_llm_meta()
     if phase_fn:
         phase_fn("companies", {"companies": companies})
+
+    # Registry enrichment pass — overwrites LLM-inferred fields with authoritative data
+    _log("=== Applying registry overrides ===")
+    try:
+        companies = _apply_registry_overrides(companies, settings, log_fn=log_fn)
+    except Exception as e:
+        _log(f"WARNING: Registry override pass failed — {e}")
 
     # Join citation repair (it ran in parallel with Phases 2 & 3).
     # If any URLs were fixed, re-stream the updated sector brief so the
@@ -1278,7 +1466,7 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
     if verification_enabled:
         from verification import verify_research, _wrap_unverified
         try:
-            return verify_research(
+            result = verify_research(
                 raw_result,
                 settings=settings,
                 log_fn=log_fn,
@@ -1288,7 +1476,16 @@ def run_research(thesis: str, settings: dict = None, log_fn=None, phase_fn=None)
         except Exception as e:
             _log(f"WARNING: Verification pass failed — {e}. Returning unverified result.")
             from verification import _wrap_unverified
-            return _wrap_unverified(raw_result)
+            result = _wrap_unverified(raw_result)
     else:
         from verification import _wrap_unverified
-        return _wrap_unverified(raw_result)
+        result = _wrap_unverified(raw_result)
+
+    verification_meta = _get_last_llm_meta()
+    result["_llm_meta"] = {
+        "sector_brief": sector_brief_meta,
+        "conferences": conferences_meta,
+        "companies": companies_meta,
+        "verification": verification_meta,
+    }
+    return result

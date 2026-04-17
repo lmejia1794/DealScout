@@ -184,6 +184,65 @@ def generate_profile(company: dict, thesis: str, log_fn=None, settings: dict = N
             log_fn(msg)
 
     _log("=== Profile Generation ===")
+    settings = settings or {}
+
+    # Registry + news enrichment (primary sources — injected before LLM prompt)
+    _log("Running registry enrichment...")
+    authoritative_context = ""
+    news_articles = company.get("_news", [])  # may already be populated from research pass
+    logo_url = company.get("_logo_url")
+    try:
+        from registries import enrich_company
+        registry_enabled = settings.get("registry_enrichment_enabled", True)
+        news_enabled = settings.get("news_enrichment_enabled", True)
+        enrichment = enrich_company(
+            company.get("name"), company.get("country"), company.get("website"), log_fn=log_fn
+        )
+        reg = enrichment.get("best_registry") if registry_enabled else None
+        if not news_articles and news_enabled:
+            news_articles = enrichment.get("news", [])
+        if not logo_url:
+            logo_url = enrichment.get("logo_url")
+
+        # Resolved values — used both in auth block and to update company_summary
+        reg_founded = None
+        reg_employees = None
+
+        auth_lines = []
+        if reg:
+            auth_lines.append(
+                f"AUTHORITATIVE REGISTRY DATA ({reg['source']}) — use these values directly, do not infer alternatives:"
+            )
+            date = reg.get("incorporated_on") or reg.get("inception_year")
+            if date:
+                reg_founded = str(date)[:4]
+                auth_lines.append(f"  Founded: {reg_founded}")
+            if reg.get("registered_name"):
+                auth_lines.append(f"  Legal name: {reg['registered_name']}")
+            if reg.get("status"):
+                auth_lines.append(f"  Status: {reg['status']}")
+            if reg.get("registered_address"):
+                auth_lines.append(f"  Registered address: {reg['registered_address']}")
+            if reg.get("company_type"):
+                auth_lines.append(f"  Company type: {reg['company_type']}")
+            sic = reg.get("sic_codes", [])
+            if sic:
+                auth_lines.append(f"  SIC codes: {', '.join(sic)} (use to inform sector and competitive positioning)")
+            reg_employees = reg.get("employee_count")
+            if reg_employees:
+                auth_lines.append(f"  Employee count: {reg_employees}")
+        if news_articles and news_enabled:
+            auth_lines.append(
+                "\nVERIFIED RECENT NEWS — use these as primary source for the recent_news section:"
+            )
+            for a in news_articles:
+                auth_lines.append(
+                    f"  - {a['title']} ({a['source']}, {a.get('published_at','')[:10]}): {a.get('description','')}"
+                )
+            auth_lines.append("Only include news from the list above in the recent_news section. Do not fabricate news.")
+        authoritative_context = "\n".join(auth_lines)
+    except Exception as exc:
+        _log(f"Registry enrichment failed: {exc}")
 
     # Step 1 — Tavily searches
     if _google_available():
@@ -206,13 +265,13 @@ def generate_profile(company: dict, thesis: str, log_fn=None, settings: dict = N
             web_context = web_context[:WEB_CTX_MAX]
             _log(f"Web context truncated to {WEB_CTX_MAX} chars")
 
-    # Build company summary from Phase 1 data
+    # Build company summary — prefer registry-confirmed values over LLM inference
     company_summary = f"""Company: {company.get('name')}
 Country / HQ: {company.get('hq_city', '')}, {company.get('country', '')}
 Ownership: {company.get('ownership', 'Unknown')}
-Founded: {company.get('founded', 'Unknown')}
+Founded: {reg_founded or company.get('founded', 'Unknown')}
 Estimated ARR: {company.get('estimated_arr', 'Unknown')}
-Employees: {company.get('employee_count', 'Unknown')}
+Employees: {reg_employees or company.get('employee_count', 'Unknown')}
 Website: {company.get('website', 'N/A')}
 Description: {company.get('description', '')}
 Fit rationale: {company.get('fit_rationale', '')}
@@ -226,8 +285,9 @@ Growth signals: {', '.join(company.get('signals', []))}"""
 
     # Step 2 — Profile generation
     _log("Generating company profile...")
+    auth_section = f"\n{authoritative_context}\n" if authoritative_context else ""
     profile_prompt = f"""You are a senior private equity analyst at a European B2B tech fund.
-
+{auth_section}
 Investment thesis: {thesis}
 
 Company data from initial screening:
@@ -304,6 +364,7 @@ Do NOT include linkedin_url — omit that field entirely."""
                     company_website=company.get("website"),
                     company_country=company.get("country"),
                     log_fn=log_fn,
+                    pdl_enabled=settings.get("pdl_enrichment_enabled", True),
                 )
             except Exception as e:
                 _log(f"  Enrichment failed for {name}: {e}")
@@ -330,11 +391,17 @@ Do NOT include linkedin_url — omit that field entirely."""
 
         for dm in decision_makers:
             _, contact = contacts.get(id(dm), (dm, {"enrichment_notes": "No result"}))
+            # PDL puts linkedin_url in the contact dict — promote it to the DM level
+            # where the UI expects it (dm.linkedin_url, not dm.contact.linkedin_url)
+            if contact.get("linkedin_url") and not dm.get("linkedin_url"):
+                dm["linkedin_url"] = contact.pop("linkedin_url")
             dm["contact"] = contact
     else:
         _log("Contact enrichment disabled in settings — skipping")
 
     profile_data["decision_makers"] = decision_makers
+    profile_data["logo_url"] = logo_url
+    profile_data["news"] = news_articles
     return profile_data
 
 

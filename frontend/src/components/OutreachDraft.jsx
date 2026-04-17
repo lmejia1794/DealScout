@@ -15,7 +15,9 @@ export default function OutreachDraft({ company, profile, thesis }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company, profile, thesis }),
       })
+      if (!resp.ok) throw new Error(`Server error ${resp.status}`)
       const data = await resp.json()
+      if (!data.subject && !data.body) throw new Error('Empty response from server')
       setSubject(data.subject || '')
       setBody(data.body || '')
       setstate('done')

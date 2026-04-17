@@ -15,6 +15,7 @@ function Field({ label, hint, children }) {
 export default function SettingsDrawer() {
   const { settings, update, reset } = useSettings()
   const [open, setOpen] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   return (
     <>
@@ -58,40 +59,6 @@ export default function SettingsDrawer() {
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-5 space-y-5">
-
-          {/* Temperature */}
-          <Field label="Temperature" hint="Lower = more deterministic. Higher = more creative.">
-            <div className="flex items-center gap-3">
-              <input
-                type="range" min={0} max={1} step={0.05}
-                value={settings.temperature}
-                onChange={e => update('temperature', parseFloat(e.target.value))}
-                className="flex-1"
-              />
-              <span className="text-xs font-mono w-8 text-right text-gray-700">
-                {settings.temperature.toFixed(2)}
-              </span>
-            </div>
-          </Field>
-
-          {/* Token limits */}
-          <div className="grid grid-cols-2 gap-3">
-            {[
-              ['max_tokens_brief',    'Max tokens — brief'],
-              ['max_tokens_json',     'Max tokens — JSON'],
-              ['max_tokens_profile',  'Max tokens — profile'],
-              ['max_tokens_outreach', 'Max tokens — outreach'],
-            ].map(([key, label]) => (
-              <Field key={key} label={label}>
-                <input
-                  type="number" min={100} max={8000} step={100}
-                  value={settings[key]}
-                  onChange={e => update(key, parseInt(e.target.value, 10))}
-                  className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400"
-                />
-              </Field>
-            ))}
-          </div>
 
           {/* Tavily max results */}
           <Field label="Tavily max results" hint="Results per search query (1–10).">
@@ -213,6 +180,72 @@ export default function SettingsDrawer() {
             </label>
           </Field>
 
+          {/* Registry lookup */}
+          <Field
+            label="Registry lookup"
+            hint="Overwrites LLM-inferred founding year and legal name with authoritative registry data (Companies House, Wikidata). Free."
+          >
+            <label className="flex items-center gap-2 cursor-pointer mt-1">
+              <div
+                onClick={() => update('registry_enrichment_enabled', !settings.registry_enrichment_enabled)}
+                className={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                  settings.registry_enrichment_enabled ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                  settings.registry_enrichment_enabled ? 'translate-x-4' : 'translate-x-0'
+                }`} />
+              </div>
+              <span className="text-sm text-gray-700">
+                {settings.registry_enrichment_enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            </label>
+          </Field>
+
+          {/* Recent news */}
+          <Field
+            label="Recent news"
+            hint="NewsAPI: PE-relevant articles only. 100 req/day free, cached per session."
+          >
+            <label className="flex items-center gap-2 cursor-pointer mt-1">
+              <div
+                onClick={() => update('news_enrichment_enabled', !settings.news_enrichment_enabled)}
+                className={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                  settings.news_enrichment_enabled ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                  settings.news_enrichment_enabled ? 'translate-x-4' : 'translate-x-0'
+                }`} />
+              </div>
+              <span className="text-sm text-gray-700">
+                {settings.news_enrichment_enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            </label>
+          </Field>
+
+          {/* PDL contact lookup */}
+          <Field
+            label="PDL contact lookup"
+            hint="LinkedIn URLs only on free tier (100 lookups/month). Requires PDL_API_KEY."
+          >
+            <label className="flex items-center gap-2 cursor-pointer mt-1">
+              <div
+                onClick={() => update('pdl_enrichment_enabled', !settings.pdl_enrichment_enabled)}
+                className={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                  settings.pdl_enrichment_enabled ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                  settings.pdl_enrichment_enabled ? 'translate-x-4' : 'translate-x-0'
+                }`} />
+              </div>
+              <span className="text-sm text-gray-700">
+                {settings.pdl_enrichment_enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            </label>
+          </Field>
+
           {/* AI verification */}
           <Field
             label="AI verification pass"
@@ -281,15 +314,69 @@ export default function SettingsDrawer() {
             </div>
           )}
 
-          {/* System prompt */}
-          <Field label="System prompt">
-            <textarea
-              rows={5}
-              value={settings.system_prompt}
-              onChange={e => update('system_prompt', e.target.value)}
-              className="w-full border border-gray-200 rounded-lg px-2.5 py-2 text-sm text-gray-800 font-mono resize-y focus:outline-none focus:ring-2 focus:ring-blue-400"
-            />
-          </Field>
+          {/* Advanced settings */}
+          <div className="border border-gray-200 rounded-lg overflow-hidden">
+            <button
+              onClick={() => setShowAdvanced(v => !v)}
+              className="w-full flex items-center justify-between px-3 py-2.5 text-xs font-semibold text-gray-600 hover:bg-gray-50 transition-colors"
+            >
+              <span>Advanced</span>
+              <svg
+                className={`w-3.5 h-3.5 text-gray-400 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}
+                fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+
+            {showAdvanced && (
+              <div className="px-3 pb-4 pt-2 space-y-4 border-t border-gray-100">
+                {/* Temperature */}
+                <Field label="Temperature" hint="Lower = more deterministic. Higher = more creative.">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="range" min={0} max={1} step={0.05}
+                      value={settings.temperature}
+                      onChange={e => update('temperature', parseFloat(e.target.value))}
+                      className="flex-1"
+                    />
+                    <span className="text-xs font-mono w-8 text-right text-gray-700">
+                      {settings.temperature.toFixed(2)}
+                    </span>
+                  </div>
+                </Field>
+
+                {/* Token limits */}
+                <div className="grid grid-cols-2 gap-3">
+                  {[
+                    ['max_tokens_brief',    'Max tokens — brief'],
+                    ['max_tokens_json',     'Max tokens — JSON'],
+                    ['max_tokens_profile',  'Max tokens — profile'],
+                    ['max_tokens_outreach', 'Max tokens — outreach'],
+                  ].map(([key, label]) => (
+                    <Field key={key} label={label}>
+                      <input
+                        type="number" min={100} max={8000} step={100}
+                        value={settings[key]}
+                        onChange={e => update(key, parseInt(e.target.value, 10))}
+                        className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                      />
+                    </Field>
+                  ))}
+                </div>
+
+                {/* System prompt */}
+                <Field label="System prompt">
+                  <textarea
+                    rows={5}
+                    value={settings.system_prompt}
+                    onChange={e => update('system_prompt', e.target.value)}
+                    className="w-full border border-gray-200 rounded-lg px-2.5 py-2 text-sm text-gray-800 font-mono resize-y focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </Field>
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="px-5 py-4 border-t border-gray-200">

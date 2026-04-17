@@ -22,7 +22,9 @@
       "Bash(.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
       "Read(//tmp/**)",
       "Bash(pkill -f \"uvicorn main:app\")",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(pip3 install *)",
+      "Bash(/Users/luismejia/Documents/dsail_project/backend/.venv/bin/pip install *)"
     ]
   }
 }

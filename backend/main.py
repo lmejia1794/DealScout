@@ -5,15 +5,16 @@ import os
 import queue
 import threading
 import time
+import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 load_dotenv()
 
-from models import ResearchRequest, TestRequest, ProfileRequest, OutreachRequest, ComparablesRequest, FieldVerifyRequest, FieldVerifyResponse, Verification
+from models import ResearchRequest, TestRequest, StepRequest, ProfileRequest, OutreachRequest, ComparablesRequest, FieldVerifyRequest, FieldVerifyResponse, Verification
 from research import generate_sector_brief, generate_conferences, generate_companies, run_research
 from profile import generate_profile, generate_outreach, _hunter_email, _enrich_decision_makers
 from comparables import generate_comparables
@@ -68,6 +69,47 @@ def _wrap_log_fn(inner_log_fn, run_label: str):
 
     return wrapped, close
 
+
+# ---------------------------------------------------------------------------
+# Job registry — persistent event buffer so clients can reconnect after refresh
+# ---------------------------------------------------------------------------
+
+_job_registry: dict = {}   # job_id -> {buffer, status, lock, created_at}
+_registry_lock = threading.Lock()
+_JOB_TTL = 7200  # 2 hours
+
+
+def _create_job() -> tuple:
+    job_id = str(uuid.uuid4())
+    job = {"buffer": [], "status": "running", "created_at": time.time(), "lock": threading.Lock()}
+    with _registry_lock:
+        _job_registry[job_id] = job
+        cutoff = time.time() - _JOB_TTL
+        for jid in [k for k, v in _job_registry.items() if v["created_at"] < cutoff]:
+            del _job_registry[jid]
+    return job_id, job
+
+
+def _append_job_event(job: dict, event: dict) -> None:
+    with job["lock"]:
+        job["buffer"].append(event)
+
+
+async def _poll_job_stream(job: dict, from_index: int = 0):
+    """Yield SSE-formatted strings from job buffer starting at from_index."""
+    idx = from_index
+    while True:
+        with job["lock"]:
+            snapshot = list(job["buffer"][idx:])
+            status = job["status"]
+        for event in snapshot:
+            yield f"data: {json.dumps(event)}\n\n"
+            idx += 1
+        if status in ("done", "error") and not snapshot:
+            break
+        await asyncio.sleep(0.1)
+
+
 app = FastAPI(title="DealScout API", version="1.0.0")
 
 app.add_middleware(
@@ -94,55 +136,66 @@ async def research(req: ResearchRequest):
             yield f"data: {json.dumps({'type': 'error', 'message': 'Thesis cannot be empty.'})}\n\n"
         return StreamingResponse(_err(), media_type="text/event-stream")
 
-    log_q: queue.Queue = queue.Queue()
-    result_holder: dict = {}
+    job_id, job = _create_job()
 
     def run():
         def _queue_log(msg):
-            log_q.put({"type": "log", "message": msg})
+            _append_job_event(job, {"type": "log", "message": msg})
 
         log_fn, close_log = _wrap_log_fn(_queue_log, f"research: {req.thesis[:60]}")
 
         def phase_fn(phase, data):
-            log_q.put({"type": "phase_result", "phase": phase, "data": data})
+            _append_job_event(job, {"type": "phase_result", "phase": phase, "data": data})
 
+        final_status = "error"
         try:
             result = run_research(req.thesis, settings=req.settings, log_fn=log_fn, phase_fn=phase_fn)
-            result_holder["data"] = result
+            _append_job_event(job, {"type": "result", "data": result})
+            final_status = "done"
         except RuntimeError as e:
             log_fn(f"ERROR: {e}")
-            result_holder["error"] = str(e)
+            _append_job_event(job, {"type": "error", "message": str(e)})
         except Exception as e:
             logger.exception("Unexpected error in run_research")
             log_fn(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
-            result_holder["error"] = f"Unexpected server error: {type(e).__name__}: {e}"
+            _append_job_event(job, {"type": "error", "message": f"Unexpected server error: {type(e).__name__}: {e}"})
         finally:
             close_log()
-            log_q.put(None)  # sentinel — pipeline finished
+            with job["lock"]:
+                job["status"] = final_status
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
     async def event_stream():
-        while True:
-            try:
-                item = log_q.get_nowait()
-            except queue.Empty:
-                await asyncio.sleep(0.1)
-                continue
-
-            if item is None:
-                break  # pipeline done
-            yield f"data: {json.dumps(item)}\n\n"
-
-        thread.join(timeout=5)
-
-        if "error" in result_holder:
-            yield f"data: {json.dumps({'type': 'error', 'message': result_holder['error']})}\n\n"
-        else:
-            yield f"data: {json.dumps({'type': 'result', 'data': result_holder['data']})}\n\n"
+        yield f"data: {json.dumps({'type': 'job_id', 'job_id': job_id})}\n\n"
+        async for chunk in _poll_job_stream(job):
+            yield chunk
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/research/jobs/{job_id}")
+async def reconnect_research_job(job_id: str):
+    """Reconnect to a running or completed research job after a page refresh."""
+    job = _job_registry.get(job_id)
+    if not job:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+
+    async def stream():
+        # Replay phase/result events from current buffer (skip logs to avoid duplication)
+        with job["lock"]:
+            replay = [e for e in job["buffer"] if e.get("type") in ("phase_result", "result", "error")]
+            live_start = len(job["buffer"])
+
+        for event in replay:
+            yield f"data: {json.dumps(event)}\n\n"
+
+        # Continue streaming new events from where the buffer was at reconnect time
+        async for chunk in _poll_job_stream(job, from_index=live_start):
+            yield chunk
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/api/test")
@@ -196,6 +249,64 @@ async def test_step(req: TestRequest):
 
         thread.join(timeout=5)
 
+        if "error" in result_holder:
+            yield f"data: {json.dumps({'type': 'error', 'message': result_holder['error']})}\n\n"
+        else:
+            yield f"data: {json.dumps({'type': 'result', 'data': result_holder['data']})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Regenerate a single pipeline step with existing context (SSE)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/research/step")
+async def research_step(req: StepRequest):
+    """
+    Regenerate one step using the current context.
+    POST /api/research/step
+    { "step": "sector_brief"|"conferences"|"companies", "thesis": "...",
+      "sector_brief": "...", "settings": {...} }
+    Returns same SSE format as /api/research/run.
+    """
+    log_q: queue.Queue = queue.Queue()
+    result_holder: dict = {}
+
+    def run():
+        def log_fn(msg):
+            log_q.put({"type": "log", "message": msg})
+        try:
+            s = req.settings or {}
+            if req.step == "sector_brief":
+                data = generate_sector_brief(req.thesis, log_fn=log_fn, settings=s)
+                result_holder["data"] = {"sector_brief": data, "sector_brief_verification": None}
+            elif req.step == "conferences":
+                data, _ = generate_conferences(req.thesis, sector_brief=req.sector_brief, log_fn=log_fn, settings=s)
+                result_holder["data"] = {"conferences": data}
+            else:  # companies
+                data, _ = generate_companies(req.thesis, sector_brief=req.sector_brief, log_fn=log_fn, settings=s)
+                result_holder["data"] = {"companies": data}
+        except Exception as e:
+            logger.exception("Error regenerating step %s", req.step)
+            result_holder["error"] = str(e)
+        finally:
+            log_q.put(None)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    async def event_stream():
+        while True:
+            try:
+                item = log_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+                continue
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+        thread.join(timeout=5)
         if "error" in result_holder:
             yield f"data: {json.dumps({'type': 'error', 'message': result_holder['error']})}\n\n"
         else:
@@ -330,7 +441,7 @@ async def verify_field_endpoint(req: FieldVerifyRequest):
 
     _settings = req.settings or {}
     use_tavily = bool(_settings.get('verification_tavily_enabled', TAVILY_ENABLED))
-    search_provider = _settings.get('search_provider', 'tavily')
+    search_provider = _settings.get('search_provider', 'duckduckgo')
 
     try:
         v_dict, tavily_used = verify_field(

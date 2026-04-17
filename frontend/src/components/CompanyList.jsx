@@ -1,5 +1,6 @@
 import React from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
+import LlmBadge from './LlmBadge'
 
 const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
 
@@ -209,7 +210,8 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
 
 export default function CompanyList({
   companies, onViewProfile, selectedCompanies = [], onToggleCompany,
-  companiesContext = "", onUpdateVerification, sessionCapReached, onTavilyUsed,
+  companiesContext = "", onUpdateVerification, sessionCapReached, onTavilyUsed, llmMeta,
+  regenerating, onRegenerate,
 }) {
   const [removed, setRemoved] = React.useState(new Set())
 
@@ -228,11 +230,23 @@ export default function CompanyList({
 
   return (
     <div>
-      <h2 className="text-lg font-bold text-gray-800 mb-4">
+      <h2 className="flex items-center gap-2 flex-wrap text-lg font-bold text-gray-800 mb-4">
         Company Universe{' '}
         <span className="text-sm font-normal text-gray-400">
           ({visible.length} companies{removed.size > 0 ? `, ${removed.size} removed` : ''})
         </span>
+        <LlmBadge meta={llmMeta} />
+        {onRegenerate && (
+          <button
+            onClick={onRegenerate}
+            disabled={regenerating}
+            className="inline-flex items-center gap-1 text-xs font-normal text-gray-400 hover:text-gray-700 border border-gray-200 rounded-md px-2 py-0.5 bg-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {regenerating
+              ? <><span className="w-3 h-3 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" /> Regenerating…</>
+              : '↻ Regenerate'}
+          </button>
+        )}
       </h2>
       <div className="space-y-4">
         {visible.map((item, i) => {

@@ -156,20 +156,19 @@ function LogPanel({ logs, loading }) {
       {expanded && (
         <div ref={scrollContainerRef} className="bg-gray-950 px-4 py-3 max-h-72 overflow-y-auto font-mono text-xs">
           {logs.map((line, i) => {
-            const isPhase = line.startsWith('===')
-            const isError = line.startsWith('ERROR')
+            const isPhase   = line.startsWith('===')
+            const isError   = line.startsWith('ERROR')
             const isStopped = line === '— stopped by user —'
+            const isLlm     = line.startsWith('LLM:')
             return (
               <div
                 key={i}
                 className={
-                  isStopped
-                    ? 'text-yellow-400 font-semibold mt-2'
-                    : isPhase
-                    ? 'text-blue-400 font-semibold mt-2 mb-0.5'
-                    : isError
-                    ? 'text-red-400'
-                    : 'text-green-300'
+                  isStopped ? 'text-yellow-400 font-semibold mt-2'
+                  : isPhase   ? 'text-blue-400 font-semibold mt-2 mb-0.5'
+                  : isError   ? 'text-red-400'
+                  : isLlm     ? 'text-cyan-400 font-semibold'
+                  : 'text-green-300'
                 }
               >
                 {!isPhase && !isStopped && <span className="text-gray-600 select-none mr-2">›</span>}
@@ -248,6 +247,7 @@ export default function App() {
 
   const [modalCompany, setModalCompany] = useState(null)
   const [preparingReport, setPreparingReport] = useState(false)
+  const [regenStep, setRegenStep] = useState(null) // null | 'sector_brief' | 'conferences' | 'companies'
 
   // Track which job IDs have already been auto-saved to prevent duplicates
   const savedJobIds = useRef(new Set())
@@ -280,6 +280,7 @@ export default function App() {
           thesis: job.thesis,
           ...job.results,
           comparables: null,
+          logs: job.logs || [],
           saved_at: job.completedAt || new Date().toISOString(),
         }
         setSavedSearches(prev => {
@@ -294,17 +295,20 @@ export default function App() {
   // Derive display state from active job (live) or viewed search (historical)
   const displayThesis = activeJob?.thesis || viewingSearch?.thesis || ''
   const displayResults = activeJob?.results || viewingSearch?.results || null
-  const displayLogs = activeJob?.logs || []
+  const displayLlmMeta = displayResults?._llm_meta || null
+  const displayLogs = activeJob?.logs || viewingSearch?.logs || []
   const displayLoading = !!activeJob && activeJob.status === 'running'
   const displayError = activeJob?.status === 'error' ? activeJob.error : null
 
   // Jobs currently running or queued — shown in sidebar
   const activePipelineJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued')
 
-  const autoSaveComparables = (txns) => {
+  const autoSaveComparables = (txns, forThesis) => {
     setSavedSearches(prev => {
       if (!prev.length) return prev
-      const updated = [{ ...prev[0], comparables: txns }, ...prev.slice(1)]
+      const updated = forThesis
+        ? prev.map(s => s.thesis === forThesis ? { ...s, comparables: txns } : s)
+        : [{ ...prev[0], comparables: txns }, ...prev.slice(1)]
       saveToDisk(updated)
       return updated
     })
@@ -350,8 +354,10 @@ export default function App() {
         sector_brief_verification: s.sector_brief_verification || null,
         conferences: s.conferences,
         companies: s.companies,
+        _llm_meta: s._llm_meta || null,
       },
       comparables: s.comparables || null,
+      logs: s.logs || [],
     })
     setComparables(s.comparables || null)
   }
@@ -371,7 +377,7 @@ export default function App() {
 
   const handleComparablesLoaded = (txns) => {
     setComparables(txns)
-    autoSaveComparables(txns)
+    autoSaveComparables(txns, displayThesis)
   }
 
   const toggleCompany = (company) => {
@@ -388,6 +394,50 @@ export default function App() {
         ? prev.filter(c => c.name !== conf.name)
         : [...prev, conf]
     )
+  }
+
+  const handleRegenStep = async (step) => {
+    if (!displayResults || !displayThesis) return
+    setRegenStep(step)
+    try {
+      const resp = await fetch(`${API_BASE}/api/research/step`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          step,
+          thesis: displayThesis,
+          sector_brief: displayResults.sector_brief || '',
+          settings,
+        }),
+      })
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let event
+          try { event = JSON.parse(line.slice(6)) } catch { continue }
+          if (event.type === 'result') {
+            const patch = event.data
+            if (activeJob) {
+              patchJobResults(activeJob.id, r => ({ ...r, ...patch }))
+            } else if (viewingSearch) {
+              setViewingSearch(prev => prev ? { ...prev, results: { ...prev.results, ...patch } } : prev)
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Regen step failed:', e)
+    } finally {
+      setRegenStep(null)
+    }
   }
 
   const fetchProfileSilent = async (company) => {
@@ -508,7 +558,13 @@ export default function App() {
               />
             )}
             {displayResults.sector_brief && (
-              <SectorBrief content={displayResults.sector_brief} verification={displayResults.sector_brief_verification} />
+              <SectorBrief
+                content={displayResults.sector_brief}
+                verification={displayResults.sector_brief_verification}
+                llmMeta={displayLlmMeta?.sector_brief}
+                regenerating={regenStep === 'sector_brief'}
+                onRegenerate={() => handleRegenStep('sector_brief')}
+              />
             )}
             {displayResults.conferences && (
               <ConferenceGrid
@@ -519,6 +575,9 @@ export default function App() {
                 onUpdateVerification={(name, field, v) => handleUpdateVerification('conference', name, field, v)}
                 sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
                 onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
+                llmMeta={displayLlmMeta?.conferences}
+                regenerating={regenStep === 'conferences'}
+                onRegenerate={() => handleRegenStep('conferences')}
               />
             )}
             {displayResults.companies && (
@@ -531,10 +590,14 @@ export default function App() {
                 onUpdateVerification={(name, field, v) => handleUpdateVerification('company', name, field, v)}
                 sessionCapReached={tavilyCallsUsed >= (settings.verification_tavily_max_calls || 20)}
                 onTavilyUsed={() => setTavilyCallsUsed(n => n + 1)}
+                llmMeta={displayLlmMeta?.companies}
+                regenerating={regenStep === 'companies'}
+                onRegenerate={() => handleRegenStep('companies')}
               />
             )}
             {!displayLoading && (
               <ComparablesPanel
+                key={displayThesis}
                 thesis={displayThesis}
                 sectorBrief={displayResults.sector_brief}
                 transactions={comparables}
@@ -567,6 +630,53 @@ export default function App() {
         onPreviewReport={handlePreviewReport}
         preparingReport={preparingReport}
       />
+
+      {/* Report preparation overlay */}
+      {preparingReport && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-2xl px-8 py-10 w-full max-w-sm mx-4">
+            <div className="flex flex-col items-center gap-4">
+              {/* Spinner */}
+              <div className="relative w-14 h-14">
+                <div className="absolute inset-0 rounded-full border-4 border-blue-100" />
+                <div className="absolute inset-0 rounded-full border-4 border-transparent border-t-blue-600 animate-spin" />
+                <div className="absolute inset-2 rounded-full border-4 border-transparent border-t-blue-300 animate-spin [animation-duration:1.5s] [animation-direction:reverse]" />
+              </div>
+              <div className="text-center">
+                <h3 className="text-lg font-bold text-gray-900">Preparing Report</h3>
+                <p className="text-sm text-gray-500 mt-1">
+                  {(() => {
+                    const missingCount = selectedCompanies.filter(c => !profiles[c.name]).length
+                    return missingCount > 0
+                      ? `Fetching ${missingCount} new ${missingCount === 1 ? 'profile' : 'profiles'}…`
+                      : 'Building report…'
+                  })()}
+                </p>
+              </div>
+              {/* Company list */}
+              {selectedCompanies.length > 0 && (
+                <div className="w-full space-y-2 mt-1">
+                  {selectedCompanies.map((c) => {
+                    const cached = !!profiles[c.name]
+                    return (
+                      <div key={c.name} className="flex items-center gap-2.5 text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded-lg">
+                        {cached
+                          ? <span className="text-green-500 text-xs shrink-0">✓</span>
+                          : <span className="w-3 h-3 border-2 border-blue-300 border-t-blue-600 rounded-full animate-spin shrink-0" />
+                        }
+                        <span className="truncate">{c.name}</span>
+                        <span className="ml-auto text-xs text-gray-400 shrink-0">
+                          {cached ? 'cached' : c.country}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
