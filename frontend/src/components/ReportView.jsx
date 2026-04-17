@@ -96,7 +96,15 @@ function CompanyBlock({ company, profile, isLast }) {
       {/* Header */}
       <div className="flex items-start justify-between mb-3">
         <div>
-          <h2 className="text-xl font-bold text-gray-900">{flag} {company.name}</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-bold text-gray-900">{flag} {company.name}</h2>
+            {company.website && (
+              <a href={company.website} target="_blank" rel="noopener noreferrer"
+                className="text-xs text-blue-500 hover:underline shrink-0">
+                {(() => { try { return new URL(company.website).hostname.replace(/^www\./, '') } catch { return 'Website' } })()} ↗
+              </a>
+            )}
+          </div>
           <p className="text-sm text-gray-500">
             {[company.hq_city, company.country].filter(Boolean).join(', ')}
           </p>
@@ -110,22 +118,22 @@ function CompanyBlock({ company, profile, isLast }) {
       <div className="flex flex-wrap gap-1.5 mb-3">
         {company.ownership && (
           <span className="bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-medium px-2 py-0.5 rounded-full">
-            {company.ownership}
+            {stripCitations(company.ownership)}
           </span>
         )}
         {company.founded && (
-          <span className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">Founded {company.founded}</span>
+          <span className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">Founded {stripCitations(company.founded)}</span>
         )}
         {company.estimated_arr && (
-          <span className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">ARR {company.estimated_arr}</span>
+          <span className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">ARR {stripCitations(company.estimated_arr)}</span>
         )}
         {company.employee_count && (
-          <span className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">{company.employee_count} employees</span>
+          <span className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">{stripCitations(company.employee_count)} employees</span>
         )}
       </div>
 
-      <p className="text-sm text-gray-700 leading-relaxed mb-2">{company.description}</p>
-      <p className="text-xs text-gray-500 italic mb-3">{company.fit_rationale}</p>
+      <p className="text-sm text-gray-700 leading-relaxed mb-2">{stripCitations(company.description)}</p>
+      <p className="text-xs text-gray-500 italic mb-3">{stripCitations(company.fit_rationale)}</p>
 
       {company.signals?.length > 0 && (
         <div className="flex flex-wrap gap-1 mb-4">
@@ -238,7 +246,7 @@ function ComparablesTable({ transactions }) {
               <td className="py-2 px-3 text-sm font-semibold text-gray-900">{tx.target}</td>
               <td className="py-2 px-3 text-sm text-gray-600">{tx.acquirer}</td>
               <td className="py-2 px-3 text-sm text-gray-500">{tx.year ?? '—'}</td>
-              <td className="py-2 px-3">
+              <td className="py-2 px-3 whitespace-nowrap">
                 <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${dealTypeClass(tx.deal_type)}`}>
                   {tx.deal_type}
                 </span>
@@ -394,11 +402,18 @@ export default function ReportView() {
                 <tbody>
                   {selectedConferences.map((conf, i) => (
                     <tr key={i} className="border-b border-gray-100">
-                      <td className="py-2.5 px-3 text-sm font-semibold text-gray-900">{conf.name}</td>
-                      <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{conf.date}</td>
-                      <td className="py-2.5 px-3 text-sm text-gray-600">{conf.location}</td>
-                      <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{conf.estimated_cost}</td>
-                      <td className="py-2.5 px-3 text-xs text-gray-500">{conf.relevance}</td>
+                      <td className="py-2.5 px-3 text-sm font-semibold text-gray-900">
+                        {conf.website ? (
+                          <a href={conf.website} target="_blank" rel="noopener noreferrer"
+                            className="hover:underline text-gray-900">
+                            {conf.name} ↗
+                          </a>
+                        ) : conf.name}
+                      </td>
+                      <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{stripCitations(conf.date)}</td>
+                      <td className="py-2.5 px-3 text-sm text-gray-600">{stripCitations(conf.location)}</td>
+                      <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{stripCitations(conf.estimated_cost)}</td>
+                      <td className="py-2.5 px-3 text-xs text-gray-500">{stripCitations(conf.relevance)}</td>
                     </tr>
                   ))}
                 </tbody>
