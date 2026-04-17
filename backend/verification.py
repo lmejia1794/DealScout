@@ -1240,7 +1240,7 @@ def verify_sector_brief(
             )
             return claim_text, result
 
-        with ThreadPoolExecutor(max_workers=min(len(url_citations), 8)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(url_citations), 4)) as pool:
             futures = {pool.submit(_verify_one_citation, cit): cit for cit in url_citations}
             for future in as_completed(futures):
                 try:
@@ -1559,7 +1559,7 @@ def verify_research(
         )
 
     n_workers = 1 + len(companies) + len(conferences)  # sector brief + each entity
-    with ThreadPoolExecutor(max_workers=max(n_workers, 1)) as pool:
+    with ThreadPoolExecutor(max_workers=min(n_workers, 6)) as pool:
         futures = {}
         futures['brief'] = pool.submit(_run_sector_brief)
         for i, c in enumerate(companies):
@@ -1710,7 +1710,7 @@ def repair_sector_brief_citations(
 
     unique_urls = list({r.url for r in refs})
     broken_map: dict = {}  # url → reason
-    with ThreadPoolExecutor(max_workers=min(len(unique_urls), 15)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(unique_urls), 5)) as pool:
         for url, is_broken, reason in pool.map(_is_broken, unique_urls):
             if is_broken:
                 broken_map[url] = reason

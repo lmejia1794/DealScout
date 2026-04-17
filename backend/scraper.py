@@ -79,7 +79,9 @@ def _scrape_one(url: str) -> tuple:
             resp = client.get(url, headers={"User-Agent": _BROWSER_UA})
             resp.raise_for_status()
 
-        soup = BeautifulSoup(resp.text, "lxml")
+        # Cap raw HTML before parsing to avoid large pages filling memory
+        raw_html = resp.text[:300_000]
+        soup = BeautifulSoup(raw_html, "lxml")
 
         # Remove noise tags
         for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside"]):
@@ -131,7 +133,7 @@ def scrape_sources(urls: list, log_fn=None) -> str:
     _log(f"Scraping {len(urls)} sources in parallel...")
 
     blocks = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(_scrape_one, url): url for url in urls}
         for future in as_completed(futures):
             url, text, err = future.result()

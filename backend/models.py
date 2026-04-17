@@ -32,17 +32,17 @@ class Conference(BaseModel):
 
 class Company(BaseModel):
     name: str
-    country: str
+    country: Optional[str] = None
     hq_city: Optional[str] = None
-    founded: Optional[int] = None
+    founded: Optional[str] = None
     estimated_arr: Optional[str] = None
     employee_count: Optional[str] = None
     ownership: Optional[str] = None
-    description: str
+    description: Optional[str] = None
     website: Optional[str] = None
-    fit_score: int
-    fit_rationale: str
-    signals: list[str]
+    fit_score: Optional[int] = None
+    fit_rationale: Optional[str] = None
+    signals: list[str] = []
 
 
 class ResearchResponse(BaseModel):

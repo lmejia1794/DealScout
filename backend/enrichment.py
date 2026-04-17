@@ -99,12 +99,12 @@ def _is_complete(c: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _fetch_page(url: str) -> Optional[str]:
-    """Fetch a URL, return HTML string or None on failure."""
+    """Fetch a URL, return HTML string or None on failure. Caps at 200 KB."""
     try:
         with httpx.Client(timeout=5, follow_redirects=True) as client:
             resp = client.get(url, headers={"User-Agent": _BROWSER_UA})
             if resp.status_code == 200:
-                return resp.text
+                return resp.text[:200_000]
     except Exception:
         pass
     return None
@@ -237,7 +237,7 @@ def _method1_website(
 
     # Fetch all candidate pages concurrently
     page_results: dict[str, Optional[str]] = {}
-    with ThreadPoolExecutor(max_workers=len(pages)) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         future_to_url = {pool.submit(_fetch_page, url): url for url in pages}
         for future in as_completed(future_to_url, timeout=8):
             url = future_to_url[future]

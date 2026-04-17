@@ -371,7 +371,7 @@ Do NOT include linkedin_url — omit that field entirely."""
                 return dm, {"enrichment_notes": f"Enrichment error: {e}"}
 
         contacts: dict = {}
-        with ThreadPoolExecutor(max_workers=len(decision_makers) or 1) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(decision_makers), 2) or 1) as pool:
             futures = {pool.submit(_enrich_one, dm): dm for dm in decision_makers}
             try:
                 for future in as_completed(futures, timeout=75):
