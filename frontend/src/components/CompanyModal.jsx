@@ -1,12 +1,10 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { API_BASE } from '../config'
+import React, { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import ServiceMap from './ServiceMap'
 import DecisionMakers from './DecisionMakers'
 import OutreachDraft from './OutreachDraft'
 import ComparablesPanel from './ComparablesPanel'
 import CompanyLogo from './CompanyLogo'
-import { useSettings } from './SettingsContext'
 
 // Reuse the same MD_COMPONENTS styling from SectorBrief
 const MD = {
@@ -79,7 +77,7 @@ function SkeletonSection({ rows }) {
   )
 }
 
-function LoadingView({ logs, company }) {
+function LoadingView({ logs, company, onStop }) {
   const [logOpen, setLogOpen] = useState(false)
   const logRef = useRef(null)
 
@@ -105,6 +103,14 @@ function LoadingView({ logs, company }) {
           <div className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse" />
           <h2 className="text-2xl font-bold text-white">{company?.name}</h2>
           <p className="text-sm text-emerald-300/70">Generating deep profile…</p>
+          {onStop && (
+            <button
+              onClick={onStop}
+              className="mt-1 text-xs text-red-300 hover:text-red-200 border border-red-700/50 hover:border-red-500 px-3 py-1 rounded-lg transition-colors"
+            >
+              Stop
+            </button>
+          )}
         </div>
       </div>
 
@@ -348,69 +354,15 @@ function ProfileView({ company, profile, thesis, comparables, onClose }) {
 // ---------------------------------------------------------------------------
 // Modal shell
 // ---------------------------------------------------------------------------
-export default function CompanyModal({ company, thesis, comparables, initialProfile, onProfileLoaded, onClose }) {
-  const [phase, setPhase] = useState(initialProfile ? 'loaded' : 'loading')
-  const [logs, setLogs] = useState([])
-  const [profile, setProfile] = useState(initialProfile || null)
-  const [errorMsg, setErrorMsg] = useState('')
-  const { settings } = useSettings()
-
-  const fetchProfile = useCallback(async () => {
-    setPhase('loading')
-    setLogs([])
-    setProfile(null)
-
-    try {
-      const resp = await fetch(`${API_BASE}/api/company/profile`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ company, thesis, settings }),
-      })
-
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop()
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          let event
-          try { event = JSON.parse(line.slice(6)) } catch { continue }
-
-          if (event.type === 'log') {
-            setLogs(prev => [...prev, event.message])
-          } else if (event.type === 'result') {
-            setProfile(event.data)
-            setPhase('loaded')
-            if (onProfileLoaded) onProfileLoaded(company.name, event.data)
-          } else if (event.type === 'error') {
-            setErrorMsg(event.message)
-            setPhase('error')
-          }
-        }
-      }
-    } catch (e) {
-      setErrorMsg(e.message || 'Something went wrong.')
-      setPhase('error')
-    }
-  }, [company, thesis])
-
-  useEffect(() => {
-    if (!initialProfile) fetchProfile()
-  }, [fetchProfile, initialProfile])
-
+export default function CompanyModal({ company, thesis, comparables, profile, fetchState, onStop, onRetry, onClose }) {
   // Close on Escape
   useEffect(() => {
     const handler = e => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
+
+  const phase = profile ? 'loaded' : fetchState?.phase || 'loading'
 
   return (
     <div className="fixed inset-0 z-50 flex items-stretch justify-center">
@@ -419,7 +371,6 @@ export default function CompanyModal({ company, thesis, comparables, initialProf
 
       {/* Panel */}
       <div className="relative z-10 w-full max-w-4xl bg-white shadow-2xl flex flex-col overflow-hidden my-0 md:my-6 md:rounded-2xl mx-auto">
-        {/* Close button (always visible) */}
         {phase !== 'loaded' && (
           <button
             onClick={onClose}
@@ -429,13 +380,13 @@ export default function CompanyModal({ company, thesis, comparables, initialProf
           </button>
         )}
 
-        {phase === 'loading' && <LoadingView logs={logs} company={company} />}
+        {phase === 'loading' && <LoadingView logs={fetchState?.logs || []} company={company} onStop={onStop} />}
 
         {phase === 'error' && (
           <div className="flex flex-col items-center justify-center h-full gap-4 px-8 py-12">
-            <p className="text-sm text-red-600">{errorMsg}</p>
+            <p className="text-sm text-red-600">{fetchState?.error || 'Something went wrong.'}</p>
             <button
-              onClick={fetchProfile}
+              onClick={onRetry}
               className="text-sm bg-blue-600 text-white px-4 py-2 rounded-lg"
             >
               Retry

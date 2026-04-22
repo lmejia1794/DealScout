@@ -254,6 +254,7 @@ export default function App() {
   const [tavilyCallsUsed, setTavilyCallsUsed] = useState(0)
 
   const [modalCompany, setModalCompany] = useState(null)
+  const [profileFetches, setProfileFetches] = useState({}) // { name: { phase, logs, error } }
   const [preparingReport, setPreparingReport] = useState(false)
   const [regenStep, setRegenStep] = useState(null) // null | 'sector_brief' | 'conferences' | 'companies'
 
@@ -261,6 +262,7 @@ export default function App() {
   const savedJobIds = useRef(new Set())
   // Persistent profile cache: { thesis: { companyName: profile } }
   const allCachedProfilesRef = useRef(loadAllProfiles())
+  const profileAbortRefs = useRef({})
   // Keep a ref to jobs so view-change effect can look up thesis without it as a dep
   const jobsRef = useRef(jobs)
   useEffect(() => { jobsRef.current = jobs }, [jobs])
@@ -518,6 +520,74 @@ export default function App() {
     })
   }
 
+  const startProfileFetch = async (company, thesis) => {
+    const name = company.name
+    const controller = new AbortController()
+    profileAbortRefs.current[name] = controller
+    setProfileFetches(prev => ({ ...prev, [name]: { phase: 'loading', logs: [], error: null } }))
+    try {
+      const resp = await fetch(`${API_BASE}/api/company/profile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ company, thesis, settings }),
+        signal: controller.signal,
+      })
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let event
+          try { event = JSON.parse(line.slice(6)) } catch { continue }
+          if (event.type === 'log') {
+            setProfileFetches(prev => {
+              const cur = prev[name]
+              if (!cur) return prev
+              return { ...prev, [name]: { ...cur, logs: [...cur.logs, event.message] } }
+            })
+          } else if (event.type === 'result') {
+            const data = event.data
+            setProfiles(prev => {
+              const updated = { ...prev, [name]: data }
+              const all = allCachedProfilesRef.current
+              all[thesis] = { ...(all[thesis] || {}), [name]: data }
+              allCachedProfilesRef.current = all
+              saveAllProfiles(all)
+              return updated
+            })
+            setProfileFetches(prev => { const n = { ...prev }; delete n[name]; return n })
+          } else if (event.type === 'error') {
+            setProfileFetches(prev => ({ ...prev, [name]: { phase: 'error', logs: prev[name]?.logs || [], error: event.message } }))
+          }
+        }
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        setProfileFetches(prev => { const n = { ...prev }; delete n[name]; return n })
+      } else {
+        setProfileFetches(prev => ({ ...prev, [name]: { phase: 'error', logs: prev[name]?.logs || [], error: e.message || 'Something went wrong.' } }))
+      }
+    }
+  }
+
+  const stopProfileFetch = (name) => {
+    profileAbortRefs.current[name]?.abort()
+    setModalCompany(null)
+  }
+
+  const handleViewProfile = (company) => {
+    setModalCompany(company)
+    if (!profiles[company.name] && !profileFetches[company.name]) {
+      startProfileFetch(company, displayThesis)
+    }
+  }
+
   const handleModalClose = () => setModalCompany(null)
 
   return (
@@ -610,7 +680,8 @@ export default function App() {
             {displayResults.companies && (
               <CompanyList
                 companies={displayResults.companies}
-                onViewProfile={setModalCompany}
+                onViewProfile={handleViewProfile}
+                loadingProfiles={new Set(Object.keys(profileFetches))}
                 selectedCompanies={selectedCompanies}
                 onToggleCompany={toggleCompany}
                 companiesContext={displayResults._companies_context || ''}
@@ -641,17 +712,10 @@ export default function App() {
           company={modalCompany}
           thesis={displayThesis}
           comparables={comparables}
-          initialProfile={profiles[modalCompany.name] || null}
-          onProfileLoaded={(name, profile) => {
-            setProfiles(prev => {
-              const updated = { ...prev, [name]: profile }
-              const all = allCachedProfilesRef.current
-              all[displayThesis] = { ...(all[displayThesis] || {}), [name]: profile }
-              allCachedProfilesRef.current = all
-              saveAllProfiles(all)
-              return updated
-            })
-          }}
+          profile={profiles[modalCompany.name] || null}
+          fetchState={profileFetches[modalCompany.name] || null}
+          onStop={() => stopProfileFetch(modalCompany.name)}
+          onRetry={() => startProfileFetch(modalCompany, displayThesis)}
           onClose={handleModalClose}
         />
       )}

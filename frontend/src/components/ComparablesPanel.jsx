@@ -70,6 +70,25 @@ export default function ComparablesPanel({ thesis, sectorBrief, transactions, on
     setLogs([])
     setError('')
 
+    let gotResult = false
+
+    const handleEvent = (line) => {
+      if (!line.startsWith('data: ')) return
+      let event
+      try { event = JSON.parse(line.slice(6)) } catch { return }
+      if (event.type === 'log') {
+        setLogs(prev => [...prev, event.message])
+      } else if (event.type === 'result') {
+        gotResult = true
+        setPhase('loaded')
+        if (onLoaded) onLoaded(event.data.transactions)
+      } else if (event.type === 'error') {
+        gotResult = true
+        setError(event.message)
+        setPhase('error')
+      }
+    }
+
     try {
       const resp = await fetch(`${API_BASE}/api/comparables`, {
         method: 'POST',
@@ -84,26 +103,23 @@ export default function ComparablesPanel({ thesis, sectorBrief, transactions, on
 
       while (true) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          buffer += decoder.decode() // flush
+          break
+        }
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop()
+        for (const line of lines) handleEvent(line)
+      }
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          let event
-          try { event = JSON.parse(line.slice(6)) } catch { continue }
+      // Process any data left in buffer after stream closes
+      for (const line of buffer.split('\n')) handleEvent(line)
 
-          if (event.type === 'log') {
-            setLogs(prev => [...prev, event.message])
-          } else if (event.type === 'result') {
-            setPhase('loaded')
-            if (onLoaded) onLoaded(event.data.transactions)
-          } else if (event.type === 'error') {
-            setError(event.message)
-            setPhase('error')
-          }
-        }
+      // Stream ended without a result or error event
+      if (!gotResult) {
+        setError('Generation timed out or connection was lost. Please retry.')
+        setPhase('error')
       }
     } catch (e) {
       if (e.name !== 'AbortError') {

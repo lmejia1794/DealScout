@@ -35,7 +35,7 @@ CITATION_FETCH_MAX_CHARS = int(os.getenv("CITATION_FETCH_MAX_CHARS", "3000"))
 # When Gemini generates, OpenRouter verifies (cross-provider = strongest independence).
 # When OpenRouter generates, Gemini verifies (VERIFIER_GOOGLE_MODEL, if key is set).
 VERIFIER_OPENROUTER_MODEL = os.getenv("VERIFIER_OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
-VERIFIER_GOOGLE_MODEL = os.getenv("VERIFIER_GOOGLE_MODEL", "gemini-3-flash-preview")
+VERIFIER_GOOGLE_MODEL = os.getenv("VERIFIER_GOOGLE_MODEL", "gemini-2.5-flash")
 
 CITATION_RE = re.compile(r'\[SRC:\s*([^\]]+)\]')
 
@@ -699,8 +699,10 @@ Return ONLY a JSON object where each key matches a claim key and the value is:
 }}
 
 verdict must be exactly one of: "verified", "contradicted", "inferred", "unverifiable".
-Use "inferred" when the claim is plausible and consistent with available context but cannot be pinpointed to a specific source — e.g. a company's approximate founding year or employee range that seems right but isn't confirmed by a direct citation.
-Use "unverifiable" only when the claim is about a very specific fact that directly contradicts available evidence or is clearly implausible.
+"inferred" is the DEFAULT when a claim is plausible given what you know about this entity — use it whenever you can say "this is probably correct" even without an explicit source in the excerpts.
+"unverifiable" should be rare — use it only when you have no basis whatsoever to judge the claim (e.g. no information about this entity at all).
+"verified" requires an explicit confirmation in the excerpts.
+"contradicted" requires a clear conflict with the excerpts.
 corrected_value should be short and direct — it will be displayed inline as a replacement."""
         try:
             raw = _call_verifier_llm(prompt, max_tokens=400, use_search=False)
@@ -732,8 +734,10 @@ Return ONLY a JSON object where each key matches a claim key and the value is:
 }}
 
 verdict must be exactly one of: "verified", "contradicted", "inferred", "unverifiable".
-Use "inferred" when the claim is plausible and consistent with available context but cannot be pinpointed to a specific source — e.g. a company's approximate founding year or employee range that seems right but isn't confirmed by a direct citation.
-Use "unverifiable" only when the claim is about a very specific fact that directly contradicts available evidence or is clearly implausible.
+"inferred" is the DEFAULT when a claim is plausible given what you know about this entity — use it whenever you can say "this is probably correct" even without an explicit source in the excerpts.
+"unverifiable" should be rare — use it only when you have no basis whatsoever to judge the claim (e.g. no information about this entity at all).
+"verified" requires an explicit confirmation in the excerpts.
+"contradicted" requires a clear conflict with the excerpts.
 corrected_value should be short and direct — it will be displayed inline as a replacement."""
         try:
             raw = _call_verifier_llm(prompt, max_tokens=400, use_search=True)
@@ -780,8 +784,10 @@ Return ONLY a JSON object where each key matches a claim key and the value is:
 }}
 
 verdict must be exactly one of: "verified", "contradicted", "inferred", "unverifiable".
-Use "inferred" when the claim is plausible and consistent with available context but cannot be pinpointed to a specific source — e.g. a company's approximate founding year or employee range that seems right but isn't confirmed by a direct citation.
-Use "unverifiable" only when the claim is about a very specific fact that directly contradicts available evidence or is clearly implausible.
+"inferred" is the DEFAULT when a claim is plausible given what you know about this entity — use it whenever you can say "this is probably correct" even without an explicit source in the excerpts.
+"unverifiable" should be rare — use it only when you have no basis whatsoever to judge the claim (e.g. no information about this entity at all).
+"verified" requires an explicit confirmation in the excerpts.
+"contradicted" requires a clear conflict with the excerpts.
 corrected_value should be short and direct — it will be displayed inline as a replacement."""
         try:
             raw = _call_verifier_llm(prompt, max_tokens=400, use_search=False)
@@ -920,8 +926,9 @@ def verify_company(
     company = _clean_entity_fields(company)
 
     # Batch remaining fields
-    # Use the grounding URL from generation (Gemini grounding source) if available
-    entity_grounding_url = company.get('_grounding_url')
+    # Prefer grounding URL from generation; fall back to the company's own website
+    # (the About/homepage typically contains ownership, founding year, team info)
+    entity_grounding_url = company.get('_grounding_url') or company.get('website')
     if batch_claims:
         search_query = f'"{name}" {country} software company'
         batch = _verify_entity_batch(
@@ -1152,8 +1159,8 @@ def verify_conference(
     # existence: always Tavily batch
     batch_claims['existence'] = f'{name} is a real conference happening in {year or "2026"}'
 
-    # Use the grounding URL from generation if available
-    entity_grounding_url = conference.get('_grounding_url')
+    # Prefer grounding URL from generation; fall back to the conference's own website
+    entity_grounding_url = conference.get('_grounding_url') or conference.get('website')
 
     # Clean conference for output AFTER citation extraction
     conference = _clean_entity_fields(conference)

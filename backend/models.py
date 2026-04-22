@@ -196,7 +196,7 @@ class SettingsModel(BaseModel):
         "When asked to return markdown, return only markdown."
     )
     tavily_max_results: int = 5
-    google_model: str = "gemini-3-flash-preview"
+    google_model: str = "gemini-2.5-flash"
     google_use_search: bool = True
     openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
     source_scraping_enabled: bool = True

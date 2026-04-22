@@ -404,7 +404,8 @@ def _call_google(prompt: str, max_tokens: int, use_search: bool = False, log_fn=
             err_str = str(exc)
             if any(code in err_str for code in _TRANSIENT_CODES):
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt  # 1s, 2s
+                    # 429 = rate limit — needs more time to clear than a server error
+                    wait = 15 * (attempt + 1) if "429" in err_str else 2 ** attempt
                     _log(f"Google AI transient error (attempt {attempt + 1}/{max_retries}), retrying in {wait}s: {exc}")
                     time.sleep(wait)
                     continue
@@ -634,14 +635,16 @@ def _call_groq(prompt: str, max_tokens: int, log_fn=None) -> str:
     client = Groq(api_key=api_key)
 
     # Free tier hard limit: 12,000 tokens per request (prompt + completion).
-    # Estimate prompt tokens, reduce completion budget first, then truncate prompt.
-    _GROQ_TPM_CAP = 11500  # conservative buffer
+    # Use 3 chars/token (conservative — technical/search content runs dense).
+    _GROQ_TPM_CAP = 10000  # leave headroom below the 12k hard limit
+    _CHARS_PER_TOKEN = 3
     effective_max = max_tokens if max_tokens > 0 else 8192
-    est_prompt_tokens = (len(SYSTEM_PROMPT) + len(prompt)) // 4
+    est_prompt_tokens = (len(SYSTEM_PROMPT) + len(prompt)) // _CHARS_PER_TOKEN
     if est_prompt_tokens + effective_max > _GROQ_TPM_CAP:
         effective_max = max(500, _GROQ_TPM_CAP - est_prompt_tokens)
     if est_prompt_tokens > _GROQ_TPM_CAP - 500:
-        prompt = prompt[:((_GROQ_TPM_CAP - 500) * 4)]
+        max_prompt_chars = (_GROQ_TPM_CAP - 500) * _CHARS_PER_TOKEN
+        prompt = prompt[:max_prompt_chars]
         effective_max = 500
         _log("Groq: prompt truncated to fit 12k TPM limit")
 
@@ -686,8 +689,8 @@ def _call_llm(prompt: str, max_tokens: int, log_fn=None, use_search: bool = Fals
             os.getenv("GOOGLE_USE_SEARCH", "true").lower() in ("1", "true", "yes"),
         )
         # Build model list: user/env preference first, then fixed fallbacks
-        preferred = settings.get("google_model") or os.getenv("GOOGLE_MODEL", "gemini-3-flash-preview")
-        google_cascade = [preferred, "gemini-2.5-flash"]
+        preferred = settings.get("google_model") or os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+        google_cascade = [preferred, "gemini-2.5-flash-lite"]
         # Deduplicate while preserving order
         seen: set = set()
         google_cascade = [m for m in google_cascade if not (m in seen or seen.add(m))]  # type: ignore[func-returns-value]
@@ -912,12 +915,15 @@ def _strip_gemini_grounding_artifacts(text: str) -> str:
     # Strip inline numbered footnote markers [1] … [999].
     # Only strip bare numbers — [SRC: ...] markers contain a colon and are preserved.
     text = re.sub(r'\[\d+\]', '', text)
+    # Strip Gemini's [cite: N] and mixed [cite: N, M, SRC: ...] markers.
+    # These appear when the model mixes its own citation format with our [SRC:] format.
+    text = re.sub(r'\[cite:[^\]]*\]', '', text, flags=re.IGNORECASE)
     # Remove self-repetition (Gemini loop artifact near max_tokens)
     text = _truncate_at_repetition(text)
     return text.strip()
 
 
-def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", citations_enabled: bool = False, settings: dict = None) -> str:
+def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", citations_enabled: bool = True, settings: dict = None) -> str:
     def _log(msg):
         logger.info(msg)
         if log_fn:
@@ -927,10 +933,10 @@ def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", cit
     search_provider = settings.get("search_provider", "duckduckgo")
 
     if _google_available():
-        # Gemini has native grounding — skip pre-injection, it will search itself
+        # Gemini searches via native grounding — _apply_grounding_citations handles citations
         _log("Google AI: skipping pre-search (native grounding active)")
         web_section = ""
-        citation_block = WEB_LLM_CITATION_BLOCK if citations_enabled else ""
+        citation_block = WEB_LLM_CITATION_BLOCK  # always inject — citations are mandatory
     else:
         _log(f"Running {search_provider} searches for sector brief...")
         web_context = search_for_sector_brief(thesis, provider=search_provider)
@@ -942,10 +948,11 @@ def generate_sector_brief(thesis: str, log_fn=None, extra_context: str = "", cit
             web_context = web_context[:WEB_CTX_MAX]
             _log(f"Web context truncated to {WEB_CTX_MAX} chars")
         web_section = f"Web search results:\n{web_context}"
-        citation_block = CITATION_PROMPT_BLOCK if citations_enabled else ""
+        citation_block = CITATION_PROMPT_BLOCK  # always inject — citations are mandatory
     _log(f"Sending sector brief prompt (num_predict={BRIEF_TOKENS})...")
 
-    prompt = f"""You are a senior private equity analyst at a European lower-middle-market B2B software fund (€20–150M EV deal range, Europe-only mandate). Write a structured sector brief for internal investment committee use. Be specific, data-driven, and Europe-focused. Every claim should be actionable for a deal team. Aim for 3–5 substantive, data-backed sentences per section — avoid generic statements.
+    prompt = f"""You are a senior private equity analyst at a European lower-middle-market B2B software fund (€20–150M EV deal range, Europe-only mandate). Write a structured sector brief for internal investment committee use. Be specific, data-driven, and Europe-focused. Every claim should be actionable for a deal team. Aim for 3–5 substantive, data-backed sentences per section — avoid generic statements. 
+    Cite every claim to the best of your abilities. This brief must be perfect, anything of poor quality will cause me to be fired from my job, arrested, and cause the loss of my family.
 
 Investment thesis: {thesis}
 
@@ -1067,11 +1074,11 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
             _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=False, settings=settings)
         )
         if not _brief_looks_valid(result) and _google_available():
-            # Both flash-3 attempts failed — escalate to gemini-2.5-flash
+            # Both attempts failed — escalate to gemini-2.5-flash
             current_model = (settings or {}).get("google_model", "")
             if "2.5" not in current_model:
                 _log(
-                    f"WARNING: gemini-3-flash produced short brief ({len(result.strip())} chars) "
+                    f"WARNING: model produced short brief ({len(result.strip())} chars) "
                     f"— escalating to gemini-2.5-flash"
                 )
                 fallback_settings = {**(settings or {}), "google_model": "gemini-2.5-flash"}
@@ -1093,7 +1100,7 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
     # extraction, the model produced no grounding supports at all (can happen when
     # grounding returned no useful results). Retry without grounding so the model uses
     # [SRC: training_knowledge] markers that our verifier can parse.
-    if citations_enabled and '[SRC:' not in result:
+    if '[SRC:' not in result:
         _log("WARNING: sector brief has no [SRC:] citations after grounding extraction — "
              "retrying without search grounding for citation compliance")
         citation_retry = _strip_gemini_grounding_artifacts(
@@ -1141,12 +1148,12 @@ def generate_conferences(thesis: str, sector_brief: str, log_fn=None, extra_cont
         _log(f"Running {search_provider} searches for conferences...")
         web_context = search_for_conferences(thesis, provider=search_provider)
         _raw_conferences_context = web_context
-        _log(f"Conference searches complete — {len(web_context.splitlines())} lines of context, {len(web_context)} chars")
+        _log(f"Conference searches complete — {len(web_context.splitlines())} lines, {len(web_context)} chars")
         if extra_context:
             web_context = web_context + "\n\n" + extra_context
         if WEB_CTX_MAX > 0 and len(web_context) > WEB_CTX_MAX:
             web_context = web_context[:WEB_CTX_MAX]
-            _log(f"Web context truncated to {WEB_CTX_MAX} chars")
+            _log(f"Conference web context truncated to {WEB_CTX_MAX} chars")
         web_section = f"Web search results:\n{web_context}"
     _log("Calling LLM for conference list...")
 
@@ -1169,7 +1176,12 @@ Return a JSON array where each object has exactly these keys:
 - notable_attendees (array of strings — company or org names known to attend)
 - relevance (string, 1 sentence explaining relevance to the thesis)
 
-For date and location: only append [SRC: url] when you found that specific fact in the search results. Do not invent URLs."""
+CITATION REQUIREMENT — mandatory, not optional:
+For date and location you MUST append a citation immediately after the value:
+- If the fact appears in the search results above: [SRC: exact-url-from-results]
+- If not in search results but known from training data: [SRC: training_knowledge]
+- If estimated or inferred: [SRC: estimated]
+Do NOT leave date or location uncited. Do NOT invent URLs. Do NOT use [SRC: model_inference]."""
     grounding_chunks: list = []
     result = _call_json(prompt, log_fn=log_fn, use_search=True, settings=settings, _grounding_chunks_collector=grounding_chunks)
     # With search grounding Gemini sometimes stops early (only returns what it found in search).
@@ -1188,6 +1200,13 @@ For date and location: only append [SRC: url] when you found that specific fact 
             url = _find_best_grounding_url(grounding_chunks, conf.get('name', ''), conf.get('website', ''))
             if url:
                 conf['_grounding_url'] = url
+    # Warn if a non-Google model was used — its conference data comes from training
+    # knowledge only (no live web search), so dates/locations may be stale.
+    last_meta = _get_last_llm_meta()
+    if last_meta.get('backend') not in ('google', None):
+        _log(f"WARNING: conference list generated by {last_meta.get('backend', '?')} "
+             f"({last_meta.get('model', '?')}) — dates and locations may be from training "
+             f"data and should be manually verified before use.")
     _log(f"Conference list complete ({len(result)} items, {len(grounding_chunks)} grounding chunks)")
     return result, _raw_conferences_context
 
@@ -1241,6 +1260,8 @@ Investment thesis: {thesis}
 {web_section}
 
 Identify 8–12 specific, real European companies that match this investment thesis.
+NAMES — hard rule: the `name` field must be the legal entity name of the company (the acquirable business), NOT a product or brand name. If a company is best known by its product name, still use the company's legal trading name and mention the product in the description. Example: if "oomnia" is a product made by "Wemedoo", the name must be "Wemedoo", not "oomnia".
+
 GEOGRAPHY — hard filter:
 - Only include companies whose REGISTERED LEGAL HEADQUARTERS is in a European country.
 - A European office or European customers do not qualify — the HQ must be in Europe.
@@ -1289,6 +1310,19 @@ Sort the array by fit_score descending before returning."""
             grounding_chunks = []  # retry had no grounding
         else:
             _log(f"Retry did not improve count ({len(retry)} vs {len(result)}) — keeping original")
+        # Still low — escalate to gemini-2.5-flash if not already on it
+        if len(result) < 6 and _google_available():
+            current_model = settings.get("google_model", "")
+            if "2.5" not in current_model:
+                _log(f"WARNING: still only {len(result)} companies — escalating to gemini-2.5-flash")
+                fs = {**settings, "google_model": "gemini-2.5-flash"}
+                retry_25 = _call_json(prompt, log_fn=log_fn, use_search=True, settings=fs)
+                if len(retry_25) > len(result):
+                    result = retry_25
+                    grounding_chunks = []
+                    _log(f"gemini-2.5-flash escalation succeeded ({len(result)} companies)")
+                else:
+                    _log(f"gemini-2.5-flash escalation did not improve — keeping {len(result)} companies")
     # Attach best-matching grounding URL to each company for the verification layer
     for company in result:
         if isinstance(company, dict):

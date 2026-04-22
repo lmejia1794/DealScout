@@ -15,7 +15,7 @@ const BACKEND_LABEL = {
 function shortModel(model = '', backend = '') {
   if (!model) return BACKEND_LABEL[backend] || backend
   return model
-    .replace('gemini-3-flash-preview', 'Gemini 3 Flash')
+    .replace('gemini-2.5-flash-lite', 'Gemini 2.5 Flash Lite')
     .replace('gemini-2.5-flash', 'Gemini 2.5 Flash')
     .replace('gemini-2.0-flash', 'Gemini 2.0 Flash')
     .replace('meta-llama/llama-3.3-70b-instruct:free', 'Llama 3.3 70B')

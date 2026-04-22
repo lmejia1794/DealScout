@@ -459,8 +459,7 @@ Write a cold outreach email. Rules:
 Return ONLY a raw JSON object:
 {{"subject": "...", "body": "..."}}"""
 
-    raw = _call_llm(prompt, 600)
-    try:
+    def _parse_outreach(raw: str):
         cleaned = _escape_control_chars(_strip_json_fences(raw))
         try:
             result = json.loads(cleaned)
@@ -469,8 +468,20 @@ Return ONLY a raw JSON object:
             result = repair_json(cleaned, return_objects=True)
             if not isinstance(result, dict):
                 raise ValueError(f"json_repair returned non-dict: {type(result)}")
-        return {"subject": result.get("subject", ""), "body": result.get("body", "")}
+        return result.get("subject") or "", result.get("body") or ""
+
+    try:
+        raw = _call_llm(prompt, 1200)
+        subject, body = _parse_outreach(raw)
+        if not body:
+            logger.warning("generate_outreach: body empty on first attempt — retrying")
+            raw2 = _call_llm(prompt, 1200)
+            subject2, body2 = _parse_outreach(raw2)
+            if body2:
+                subject, body = subject2, body2
+        return {"subject": subject, "body": body}
     except Exception:
+        logger.exception("generate_outreach failed")
         return {
             "subject": f"Introduction — {company.get('name')}",
             "body": "Sorry, the email draft could not be generated. Please try again.",

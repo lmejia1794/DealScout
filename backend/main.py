@@ -278,8 +278,9 @@ async def research_step(req: StepRequest):
             log_q.put({"type": "log", "message": msg})
         try:
             s = req.settings or {}
+            citations_enabled = s.get("verification_citations_enabled", True)
             if req.step == "sector_brief":
-                data = generate_sector_brief(req.thesis, log_fn=log_fn, settings=s)
+                data = generate_sector_brief(req.thesis, log_fn=log_fn, citations_enabled=citations_enabled, settings=s)
                 result_holder["data"] = {"sector_brief": data, "sector_brief_verification": None}
             elif req.step == "conferences":
                 data, _ = generate_conferences(req.thesis, sector_brief=req.sector_brief, log_fn=log_fn, settings=s)

@@ -1,6 +1,6 @@
 export const GOOGLE_MODELS = [
-  'gemini-3-flash-preview',
   'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
 ]
 
 export const OPENROUTER_MODELS = [
@@ -18,7 +18,7 @@ export const DEFAULTS = {
   system_prompt:
     'You are a structured data assistant. When asked to return JSON, return ONLY valid JSON with no markdown fences, no preamble, and no explanation. When asked to return markdown, return only markdown.',
   tavily_max_results: 5,
-  google_model: 'gemini-3-flash-preview',
+  google_model: 'gemini-2.5-flash',
   google_use_search: true,
   openrouter_model: 'meta-llama/llama-3.3-70b-instruct:free',
   search_provider: 'duckduckgo',

@@ -93,7 +93,7 @@ export default function SettingsDrawer() {
           </Field>
 
           {/* Google AI Studio */}
-          <Field label="Google AI model" hint="Primary LLM — free at aistudio.google.com. Automatically falls back to 2.5 Flash → 2.0 Flash if unavailable.">
+          <Field label="Google AI model" hint="Primary LLM — free at aistudio.google.com. Automatically falls back to 2.0 Flash if unavailable.">
             <select
               value={settings.google_model}
               onChange={e => update('google_model', e.target.value)}

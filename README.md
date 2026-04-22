@@ -97,6 +97,74 @@ Investment thesis
 
 ---
 
+## Citations
+
+Every factual claim in the sector brief is sourced inline. The pipeline treats attribution as a first-class output, not an afterthought.
+
+**How citations are generated**
+
+When Google AI is available, the sector brief is generated with Google Search grounding active. Gemini retrieves real-time sources and embeds byte-offset metadata alongside the text. DealScout's post-processing layer reads those byte ranges and inserts `[SRC: url]` markers at the exact positions where the claim appears — so the footnote is anchored to the sentence, not appended at the end. If Gemini omits byte ranges (a model-version quirk), a fallback maps Gemini's own `[N]` inline footnote markers to grounding chunk URLs 1:1.
+
+When Google AI is unavailable, the pipeline pre-fetches relevant web pages via Tavily or DuckDuckGo, injects the page excerpts into the prompt, and instructs the model to tag each claim with the source URL it drew from.
+
+**How citations are validated**
+
+After generation, a background pass HEAD-checks every cited URL. For each citation, the verifier:
+
+- Follows redirects and records the final URL (Gemini sometimes cites vertexaisearch proxy URLs that resolve to the real page)
+- Flags URLs that return 404 or redirect back to a homepage root — those are likely hallucinated
+- Attempts a `site:` search to find a replacement if the original link is dead
+
+The rendered sector brief separates sources into two groups: verified links (shown in the footnotes panel) and flagged links (shown in a red warning block with the raw URL so you can judge for yourself).
+
+**Citation display in the UI**
+
+Each `[SRC: url]` marker is converted to a compact superscript link inline in the text. The full URL list appears in a collapsible footnotes section below the brief. The model badge (e.g. `● Gemini 2.5 Flash · search`) shows which backend produced the content and whether live search was active.
+
+---
+
+## Verification
+
+After the pipeline produces the sector brief, conference list, and company universe, a verification pass cross-checks the key facts that PE analysts rely on most.
+
+**What gets verified**
+
+| Entity | Fields checked |
+|---|---|
+| Sector brief | Sampled factual claims (market sizes, named companies, statistics) |
+| Companies | Existence, founding year, ownership type, employee count, website reachability |
+| Conferences | Existence, date and location accuracy |
+
+**Verification paths**
+
+Each field goes through the strongest available method:
+
+1. **Grounding URL fetch** — if the primary research already retrieved a grounding URL for the entity, that page is fetched and used as ground truth
+2. **Company website** — the company's own website is fetched as a high-confidence primary source for ownership and founding data
+3. **Gemini native search** — a secondary Gemini call with Google Search grounding re-queries for the specific claim
+4. **Tavily / DuckDuckGo** — dedicated search for entities where grounding context isn't available
+
+**Verification statuses**
+
+| Status | Meaning |
+|---|---|
+| `verified` | Claim explicitly confirmed by a retrieved source |
+| `inferred` | Claim is consistent with available evidence — plausible but not directly sourced |
+| `contradicted` | Retrieved source conflicts with the generated claim |
+| `unverifiable` | No usable source was found — treat with extra caution |
+
+The verifier is calibrated to prefer `inferred` over `unverifiable`. For well-known entities, training knowledge is a reasonable prior; `unverifiable` is reserved for cases where there is no basis to judge the claim at all.
+
+**Auto-correction**
+
+For `founded`, `ownership`, and `employee_count`, if the verifier finds a contradiction and has a corrected value, DealScout will automatically display the corrected figure in the company card (with the original struck through). You can override any correction via the verification badge on each pill.
+
+**Confidence score**
+
+Each company and conference receives an overall confidence score (High / Medium / Low) derived from the distribution of verification outcomes across its checked fields. The score is shown as a pill on each card and in the research confidence summary bar at the top of results.
+
+---
+
 ## Tech stack
 
 | Layer | Technology |

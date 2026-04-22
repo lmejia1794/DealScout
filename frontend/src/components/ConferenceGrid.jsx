@@ -34,6 +34,7 @@ function normalizeItem(item) {
 
 function ConferenceCard({ item, selected, onToggleSelect, conferencesContext, onUpdateVerification, onRemoveConference, sessionCapReached, onTavilyUsed }) {
   const { conference: conf, verifications, overall_confidence } = normalizeItem(item)
+  const [showVerif, setShowVerif] = useState(false)
 
   const dlV = verifications.date_location
   const existenceV = verifications.existence
@@ -88,11 +89,19 @@ function ConferenceCard({ item, selected, onToggleSelect, conferencesContext, on
               ) : (
                 <span className="text-xs text-gray-500">{displayDateLocation}</span>
               )}
-              {dlV && (
+              {showVerif && dlV && (
                 <VerificationBadge verification={dlV} fieldName="date_location" {...badgeProps('date_location')} />
               )}
-              {existenceV && !existenceContradicted && (
+              {showVerif && existenceV && !existenceContradicted && (
                 <VerificationBadge verification={existenceV} fieldName="existence" {...badgeProps('existence')} />
+              )}
+              {verifications && Object.keys(verifications).length > 0 && (
+                <button
+                  onClick={() => setShowVerif(v => !v)}
+                  className="text-[10px] text-gray-400 hover:text-gray-600 px-1.5 py-0.5 rounded border border-gray-200 hover:border-gray-300 transition-colors"
+                >
+                  {showVerif ? 'hide checks' : 'show checks'}
+                </button>
               )}
             </div>
             {overall_confidence && <div className="mt-1"><ConfidencePill confidence={overall_confidence} verifications={verifications} /></div>}

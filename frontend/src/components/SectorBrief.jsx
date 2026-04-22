@@ -14,7 +14,11 @@ function processCitations(text) {
   let refCounter = 0
 
   // Strip any incomplete citation at the very end (e.g. model hit token limit mid-marker)
-  const stripped = text.replace(/[【\[]\s*SRC:[^\]】]*$/, '').trimEnd()
+  // Also strip Gemini's [cite: N] and mixed [cite: N, SRC: ...] markers that leak through
+  const stripped = text
+    .replace(/[【\[]\s*SRC:[^\]】]*$/, '')
+    .replace(/\[cite:[^\]]*\]/gi, '')
+    .trimEnd()
 
   const processed = stripped.replace(/[【\[]SRC:\s*([^\]】]+)[】\]]/g, (match, source) => {
     source = source.trim()
@@ -179,11 +183,6 @@ function CitationFootnotes({ citations, verificationMap = {} }) {
                       onClick={e => e.stopPropagation()}>
                       {displayUrl}
                     </a>
-                    {isRedirect && (
-                      <p className="text-[10px] text-amber-500 mt-0.5">
-                        ⟳ Redirected from <span className="font-mono">{(() => { try { return new URL(url).hostname } catch { return url } })()}</span>
-                      </p>
-                    )}
                   </div>
                 </div>
               )

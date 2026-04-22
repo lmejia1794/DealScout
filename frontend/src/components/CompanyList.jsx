@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState } from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 import LlmBadge from './LlmBadge'
 import CompanyLogo from './CompanyLogo'
@@ -101,10 +101,11 @@ function OwnershipPill({ ownership, verification, badgeProps }) {
   )
 }
 
-function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesContext, onUpdateVerification, onRemoveCompany, sessionCapReached, onTavilyUsed }) {
+function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesContext, onUpdateVerification, onRemoveCompany, sessionCapReached, onTavilyUsed, loadingProfiles }) {
   const { company, verifications, overall_confidence } = normalizeItem(item)
   const flag = COUNTRY_FLAGS[company.country] || '🌍'
   const location = [company.hq_city, company.country].filter(Boolean).join(', ')
+  const [showVerif, setShowVerif] = useState(false)
 
   const existenceV = verifications.existence
   const existenceContradicted = existenceV?.status === 'contradicted'
@@ -154,15 +155,23 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
       </div>
 
       <div className="flex flex-wrap gap-1.5 items-center">
-        <OwnershipPill ownership={company.ownership} verification={verifications.ownership} badgeProps={badgeProps} />
+        <OwnershipPill ownership={company.ownership} verification={showVerif ? verifications.ownership : null} badgeProps={badgeProps} />
         {company.founded && (
-          <VerifiedPill label={`Founded ${company.founded}`} verification={verifications.founded} fieldName="founded" badgeProps={badgeProps} />
+          <VerifiedPill label={`Founded ${company.founded}`} verification={showVerif ? verifications.founded : null} fieldName="founded" badgeProps={badgeProps} />
         )}
         {company.estimated_arr && (
-          <VerifiedPill label={`ARR ${company.estimated_arr}`} verification={verifications.estimated_arr} fieldName="estimated_arr" badgeProps={badgeProps} />
+          <VerifiedPill label={`ARR ${company.estimated_arr}`} verification={showVerif ? verifications.estimated_arr : null} fieldName="estimated_arr" badgeProps={badgeProps} />
         )}
         {company.employee_count && (
-          <VerifiedPill label={`${company.employee_count} employees`} verification={verifications.employee_count} fieldName="employee_count" badgeProps={badgeProps} />
+          <VerifiedPill label={`${company.employee_count} employees`} verification={showVerif ? verifications.employee_count : null} fieldName="employee_count" badgeProps={badgeProps} />
+        )}
+        {verifications && Object.keys(verifications).length > 0 && (
+          <button
+            onClick={() => setShowVerif(v => !v)}
+            className="text-[10px] text-gray-400 hover:text-gray-600 px-1.5 py-0.5 rounded border border-gray-200 hover:border-gray-300 transition-colors"
+          >
+            {showVerif ? 'hide checks' : 'show checks'}
+          </button>
         )}
       </div>
 
@@ -202,8 +211,13 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
           </a>
         )}
         <button onClick={() => onViewProfile(company)}
-          className="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg transition-colors">
-          View Full Profile
+          className="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg transition-colors inline-flex items-center gap-1.5">
+          {loadingProfiles?.has(company.name) ? (
+            <>
+              <span className="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+              Generating…
+            </>
+          ) : 'View Full Profile'}
         </button>
       </div>
     </div>
@@ -213,7 +227,7 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
 export default function CompanyList({
   companies, onViewProfile, selectedCompanies = [], onToggleCompany,
   companiesContext = "", onUpdateVerification, sessionCapReached, onTavilyUsed, llmMeta,
-  regenerating, onRegenerate,
+  regenerating, onRegenerate, loadingProfiles,
 }) {
   const [removed, setRemoved] = React.useState(new Set())
 
@@ -265,6 +279,7 @@ export default function CompanyList({
               onRemoveCompany={(name) => setRemoved(prev => new Set([...prev, name]))}
               sessionCapReached={sessionCapReached}
               onTavilyUsed={onTavilyUsed}
+              loadingProfiles={loadingProfiles}
             />
           )
         })}
