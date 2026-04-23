@@ -148,7 +148,7 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
         </div>
         <div className="flex flex-col items-end gap-1.5">
           <span className={`text-sm font-bold px-3 py-1 rounded-full ${fitBadgeClass(company.fit_score)}`}>
-            {company.fit_score}/10
+            {company.fit_score != null ? `${company.fit_score}/10` : '?/10'}
           </span>
           <ConfidencePill confidence={overall_confidence} verifications={verifications} />
         </div>
