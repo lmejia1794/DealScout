@@ -6,6 +6,11 @@ import OutreachDraft from './OutreachDraft'
 import ComparablesPanel from './ComparablesPanel'
 import CompanyLogo from './CompanyLogo'
 
+const stripCitations = (text) => (text || '')
+  .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
+  .replace(/\[cite:[^\]]*\]/gi, '')
+  .trim()
+
 // Reuse the same MD_COMPONENTS styling from SectorBrief
 const MD = {
   h1: ({ children }) => <h1 className="text-base font-bold text-gray-900 mt-4 mb-1">{children}</h1>,
@@ -235,7 +240,7 @@ function ProfileView({ company, profile, thesis, comparables, onClose }) {
               <div className="flex flex-wrap gap-2 mt-2">
                 {company.ownership && (
                   <span className="text-xs bg-white/10 text-white/80 px-2.5 py-0.5 rounded-full">
-                    {company.ownership}
+                    {stripCitations(company.ownership)}
                   </span>
                 )}
                 <span className="text-xs text-white/60">{location}</span>
@@ -314,7 +319,7 @@ function ProfileView({ company, profile, thesis, comparables, onClose }) {
               <ReactMarkdown components={MD}>{normalize(profile.fit_assessment)}</ReactMarkdown>
             </Section>
             <Section title="Decision Makers">
-              <DecisionMakers decisionMakers={profile.decision_makers || []} />
+              <DecisionMakers decisionMakers={profile.decision_makers || []} companyName={company.name} />
             </Section>
           </div>
         </div>

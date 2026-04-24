@@ -289,6 +289,7 @@ def _apply_grounding_citations(text: str, candidate) -> str:
         logger.debug("Grounding: url_map has %d entries", len(url_map))
 
         if not url_map:
+            logger.info("Google AI: no grounding chunks in response — model used training knowledge only, no URL citations available")
             return text
 
         # --- Primary path: grounding_supports with byte-offset segments ---
@@ -1105,17 +1106,20 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
             else:
                 _log(f"WARNING: retry also produced short brief ({len(result.strip())} chars) — returning as-is")
 
-    # Guard: if citations were requested but still none appear after grounding metadata
-    # extraction, the model produced no grounding supports at all (can happen when
-    # grounding returned no useful results). Retry without grounding so the model uses
-    # [SRC: training_knowledge] markers that our verifier can parse.
-    if '[SRC:' not in result:
-        _log("WARNING: sector brief has no [SRC:] citations after grounding extraction — "
+    # Guard: if no real URL citations appear after grounding extraction, the model either
+    # returned no grounding chunks or only used [SRC: training_knowledge] / [SRC: estimated]
+    # markers. Retry without grounding so the model uses our explicit citation prompt with
+    # pre-fetched search results, which reliably produces [SRC: https://...] markers.
+    def _has_url_citations(text: str) -> bool:
+        return bool(re.search(r'\[SRC:\s*https?://', text))
+
+    if not _has_url_citations(result):
+        _log("WARNING: sector brief has no URL citations after grounding extraction — "
              "retrying without search grounding for citation compliance")
         citation_retry = _strip_gemini_grounding_artifacts(
             _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=False, settings=settings)
         )
-        if '[SRC:' in citation_retry and _brief_looks_valid(citation_retry):
+        if _has_url_citations(citation_retry) and _brief_looks_valid(citation_retry):
             result = citation_retry
             _log("Citation retry succeeded")
         elif _google_available() and "2.5" not in (settings or {}).get("google_model", ""):
@@ -1124,7 +1128,7 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
             citation_retry_25 = _strip_gemini_grounding_artifacts(
                 _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=True, settings=fallback_settings)
             )
-            if '[SRC:' in citation_retry_25 and _brief_looks_valid(citation_retry_25):
+            if _has_url_citations(citation_retry_25) and _brief_looks_valid(citation_retry_25):
                 result = citation_retry_25
                 _log("gemini-2.5-flash citation escalation succeeded")
             else:

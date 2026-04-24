@@ -2,6 +2,11 @@ import React, { useState, useRef, useEffect } from 'react'
 import { API_BASE } from '../config'
 import { useSettings } from './SettingsContext'
 
+const stripCitations = (text) => (text || '')
+  .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
+  .replace(/\[cite:[^\]]*\]/gi, '')
+  .trim()
+
 function dealTypeClass(type) {
   const t = (type || '').toLowerCase()
   if (t.includes('pe') || t.includes('buyout')) return 'bg-blue-100 text-blue-700'
@@ -18,13 +23,13 @@ function TransactionRow({ tx, expanded, onToggle }) {
         onClick={onToggle}
       >
         <td className="py-2.5 px-3 text-sm font-semibold text-gray-900 whitespace-nowrap">
-          {tx.target}
+          {stripCitations(tx.target)}
         </td>
-        <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{tx.acquirer}</td>
+        <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{stripCitations(tx.acquirer)}</td>
         <td className="py-2.5 px-3 text-sm text-gray-500 whitespace-nowrap">{tx.year ?? '—'}</td>
         <td className="py-2.5 px-3 whitespace-nowrap">
           <span className={`text-xs font-medium px-2 py-0.5 rounded-full whitespace-nowrap ${dealTypeClass(tx.deal_type)}`}>
-            {tx.deal_type}
+            {stripCitations(tx.deal_type)}
           </span>
         </td>
         <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">
@@ -38,8 +43,8 @@ function TransactionRow({ tx, expanded, onToggle }) {
       {expanded && (
         <tr className="bg-blue-50/40 border-b border-gray-100">
           <td colSpan={7} className="px-4 py-3 text-xs text-gray-600 space-y-1">
-            <p><span className="font-semibold text-gray-700">Target: </span>{tx.target_description}</p>
-            <p><span className="font-semibold text-gray-700">Relevance: </span>{tx.relevance}</p>
+            <p><span className="font-semibold text-gray-700">Target: </span>{stripCitations(tx.target_description)}</p>
+            <p><span className="font-semibold text-gray-700">Relevance: </span>{stripCitations(tx.relevance)}</p>
           </td>
         </tr>
       )}

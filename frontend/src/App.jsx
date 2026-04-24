@@ -9,6 +9,7 @@ import SettingsDrawer from './components/SettingsDrawer'
 import CompanyModal from './components/CompanyModal'
 import ComparablesPanel from './components/ComparablesPanel'
 import ReportActionBar from './components/ReportActionBar'
+import WelcomePanel from './components/WelcomePanel'
 import { useSettings } from './components/SettingsContext'
 import { usePipeline } from './components/PipelineContext'
 import { API_BASE } from './config'
@@ -246,6 +247,8 @@ export default function App() {
   // Viewing a saved search from localStorage (separate from live pipeline jobs)
   const [viewingSearch, setViewingSearch] = useState(null)
 
+  const [pendingThesis, setPendingThesis] = useState('')
+
   // Per-session transient state — resets when active view changes
   const [selectedCompanies, setSelectedCompanies] = useState([])
   const [selectedConferences, setSelectedConferences] = useState([])
@@ -344,6 +347,7 @@ export default function App() {
   }
 
   const handleSearch = (thesis) => {
+    setPendingThesis('')
     setViewingSearch(null)
     addJob(thesis, settings)
   }
@@ -620,8 +624,14 @@ export default function App() {
           onSearch={handleSearch}
           loading={displayLoading}
           hasResults={!!displayResults}
-          currentThesis={displayThesis}
+          currentThesis={pendingThesis || displayThesis}
+          onSelectExample={setPendingThesis}
         />
+
+        {/* Welcome / onboarding — shown when idle with no results */}
+        {!displayResults && !displayLoading && !displayError && displayLogs.length === 0 && (
+          <WelcomePanel onSelectExample={setPendingThesis} />
+        )}
 
         {/* Pipeline progress + logs */}
         {(displayLoading || displayLogs.length > 0) && (

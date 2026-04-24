@@ -1,5 +1,10 @@
 import React from 'react'
 
+const stripCitations = (text) => (text || '')
+  .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
+  .replace(/\[cite:[^\]]*\]/gi, '')
+  .trim()
+
 function LinkedInIcon() {
   return (
     <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
@@ -34,7 +39,7 @@ function sourceLabel(source) {
   return map[source] || source || ''
 }
 
-export default function DecisionMakers({ decisionMakers = [] }) {
+export default function DecisionMakers({ decisionMakers = [], companyName = '' }) {
   if (!decisionMakers.length) {
     return (
       <div className="text-sm text-gray-400 italic py-4 text-center">
@@ -47,15 +52,15 @@ export default function DecisionMakers({ decisionMakers = [] }) {
     <div className="space-y-3">
       {decisionMakers.map((dm, i) => {
         const contact = dm.contact || {}
-        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(`${dm.name} ${dm.notes || ''} email contact`)}`
+        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(`${dm.name}${companyName ? ' ' + companyName : ''} email contact`)}`
 
         return (
           <div key={i} className="p-3 bg-gray-50 rounded-lg space-y-2">
             {/* Name + title */}
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
-                <p className="text-sm font-semibold text-gray-900">{dm.name}</p>
-                <p className="text-xs text-gray-500">{dm.title}</p>
+                <p className="text-sm font-semibold text-gray-900">{stripCitations(dm.name)}</p>
+                <p className="text-xs text-gray-500">{stripCitations(dm.title)}</p>
               </div>
               {dm.linkedin_url && (
                 <a
@@ -71,7 +76,7 @@ export default function DecisionMakers({ decisionMakers = [] }) {
             </div>
 
             {dm.notes && (
-              <p className="text-xs text-gray-400 italic">{dm.notes}</p>
+              <p className="text-xs text-gray-400 italic">{stripCitations(dm.notes)}</p>
             )}
 
             {/* Email row — single confident address */}
@@ -120,7 +125,7 @@ export default function DecisionMakers({ decisionMakers = [] }) {
 
             {/* Enrichment notes (only when no contact found) */}
             {!contact.email && !contact.email_alternatives?.length && !contact.phone && contact.enrichment_notes && (
-              <p className="text-[11px] text-gray-400 italic">{contact.enrichment_notes}</p>
+              <p className="text-[11px] text-gray-400 italic">{stripCitations(contact.enrichment_notes)}</p>
             )}
 
             {/* Manual search escape hatch */}

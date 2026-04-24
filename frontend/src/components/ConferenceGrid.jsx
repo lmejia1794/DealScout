@@ -2,7 +2,10 @@ import React, { useState } from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 import LlmBadge from './LlmBadge'
 
-const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
+const stripCitations = (text) => (text || '')
+  .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
+  .replace(/\[cite:[^\]]*\]/gi, '')
+  .trim()
 
 const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december']
 function parseDateOrder(dateStr) {
@@ -79,7 +82,7 @@ function ConferenceCard({ item, selected, onToggleSelect, conferencesContext, on
           <input type="checkbox" checked={selected} onChange={onToggleSelect}
             className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 cursor-pointer shrink-0" />
           <div className="min-w-0">
-            <h3 className="font-semibold text-gray-900 text-sm leading-tight">{conf.name}</h3>
+            <h3 className="font-semibold text-gray-900 text-sm leading-tight">{stripCitations(conf.name)}</h3>
             <div className="flex items-center gap-1 mt-0.5 flex-wrap">
               {dateLocationCorrected && !dateLocationDisputed ? (
                 <>

@@ -347,7 +347,7 @@ Return ONLY a raw JSON object:
 }}"""
 
         from research import _strip_json_fences, _escape_control_chars
-        raw = _call_llm(prompt, 300, use_search=True)
+        raw = _call_llm(prompt, 500, use_search=True)
         cleaned = _escape_control_chars(_strip_json_fences(raw))
         try:
             data = json.loads(cleaned)
@@ -364,11 +364,16 @@ Return ONLY a raw JSON object:
             contact["email_source"] = "web_search"
             src = data.get("email_source_url", "")
             log_fn(f"  Method 3: Found email{' at ' + src if src else ''} (medium confidence)")
-        elif raw_email and '@' not in raw_email and '.' in raw_email and ' ' not in raw_email and company_website:
-            # Partial email like "christian.heidl" — complete with company domain
-            dm = re.search(r"https?://(?:www\.)?([^/]+)", company_website)
-            if dm:
-                completed = f"{raw_email}@{dm.group(1)}"
+        elif raw_email and company_website:
+            # Attempt to complete a partial/truncated address using the company domain.
+            # Covers two cases:
+            #   "fs@"           → LLM had the domain but JSON got truncated (e.g. max_tokens)
+            #   "christian.heidl" → LLM returned local-part only (no @)
+            dm_match = re.search(r"https?://(?:www\.)?([^/]+)", company_website)
+            if dm_match:
+                company_domain = dm_match.group(1)
+                local = raw_email.rstrip('@')  # strip trailing @ if present
+                completed = f"{local}@{company_domain}" if '@' not in local else raw_email
                 if _EMAIL_RE.fullmatch(completed):
                     contact["email"] = completed
                     contact["email_confidence"] = "low"

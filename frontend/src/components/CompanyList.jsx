@@ -3,7 +3,10 @@ import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 import LlmBadge from './LlmBadge'
 import CompanyLogo from './CompanyLogo'
 
-const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
+const stripCitations = (text) => (text || '')
+  .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
+  .replace(/\[cite:[^\]]*\]/gi, '')
+  .trim()
 
 const COUNTRY_FLAGS = {
   Germany: '🇩🇪', Austria: '🇦🇹', Switzerland: '🇨🇭',

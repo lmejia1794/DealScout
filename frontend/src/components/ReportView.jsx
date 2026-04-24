@@ -4,7 +4,10 @@ import ReactMarkdown from 'react-markdown'
 import ServiceMap from './ServiceMap'
 import '../report.css'
 
-const stripCitations = (text) => (text || '').replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '').trim()
+const stripCitations = (text) => (text || '')
+  .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
+  .replace(/\[cite:[^\]]*\]/gi, '')
+  .trim()
 
 // ---------------------------------------------------------------------------
 // Citation processing — same logic as SectorBrief.jsx
@@ -199,9 +202,9 @@ function CompanyBlock({ company, profile, isLast }) {
               <div className="grid grid-cols-2 gap-2">
                 {profile.decision_makers.map((dm, i) => (
                   <div key={i} className="bg-gray-50 border border-gray-100 rounded-lg px-3 py-2 text-xs space-y-0.5">
-                    <p className="font-semibold text-gray-900">{dm.name}</p>
-                    <p className="text-gray-500">{dm.title}</p>
-                    {dm.notes && <p className="text-gray-400 italic">{dm.notes}</p>}
+                    <p className="font-semibold text-gray-900">{stripCitations(dm.name)}</p>
+                    <p className="text-gray-500">{stripCitations(dm.title)}</p>
+                    {dm.notes && <p className="text-gray-400 italic">{stripCitations(dm.notes)}</p>}
                     <div className="flex flex-wrap gap-2 pt-0.5">
                       {dm.email && (
                         <a href={`mailto:${dm.email}`} className="text-blue-600 hover:underline">
@@ -243,17 +246,17 @@ function ComparablesTable({ transactions }) {
         <tbody>
           {transactions.map((tx, i) => (
             <tr key={i} className="border-b border-gray-100">
-              <td className="py-2 px-3 text-sm font-semibold text-gray-900">{tx.target}</td>
-              <td className="py-2 px-3 text-sm text-gray-600">{tx.acquirer}</td>
+              <td className="py-2 px-3 text-sm font-semibold text-gray-900">{stripCitations(tx.target)}</td>
+              <td className="py-2 px-3 text-sm text-gray-600">{stripCitations(tx.acquirer)}</td>
               <td className="py-2 px-3 text-sm text-gray-500">{tx.year ?? '—'}</td>
               <td className="py-2 px-3 whitespace-nowrap">
                 <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${dealTypeClass(tx.deal_type)}`}>
-                  {tx.deal_type}
+                  {stripCitations(tx.deal_type)}
                 </span>
               </td>
               <td className="py-2 px-3 text-sm text-gray-600">{tx.reported_ev ?? '—'}</td>
               <td className="py-2 px-3 text-sm text-gray-600">{tx.reported_multiple ?? '—'}</td>
-              <td className="py-2 px-3 text-xs text-gray-500">{tx.relevance}</td>
+              <td className="py-2 px-3 text-xs text-gray-500">{stripCitations(tx.relevance)}</td>
             </tr>
           ))}
         </tbody>
