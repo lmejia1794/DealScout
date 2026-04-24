@@ -104,7 +104,7 @@ function OwnershipPill({ ownership, verification, badgeProps }) {
   )
 }
 
-function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesContext, onUpdateVerification, onRemoveCompany, sessionCapReached, onTavilyUsed, loadingProfiles }) {
+function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesContext, onUpdateVerification, onRemoveCompany, sessionCapReached, onTavilyUsed, loadingProfiles, profiledCompanies }) {
   const { company, verifications, overall_confidence } = normalizeItem(item)
   const flag = COUNTRY_FLAGS[company.country] || '🌍'
   const location = [company.hq_city, company.country].filter(Boolean).join(', ')
@@ -220,7 +220,7 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
               <span className="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />
               Generating…
             </>
-          ) : 'View Full Profile'}
+          ) : profiledCompanies?.has(company.name) ? 'View Full Profile' : 'Generate Profile'}
         </button>
       </div>
     </div>
@@ -230,7 +230,7 @@ function CompanyCard({ item, onViewProfile, selected, onToggleSelect, companiesC
 export default function CompanyList({
   companies, onViewProfile, selectedCompanies = [], onToggleCompany,
   companiesContext = "", onUpdateVerification, sessionCapReached, onTavilyUsed, llmMeta,
-  regenerating, onRegenerate, loadingProfiles,
+  regenerating, onRegenerate, loadingProfiles, profiledCompanies,
 }) {
   const [removed, setRemoved] = React.useState(new Set())
 
@@ -283,6 +283,7 @@ export default function CompanyList({
               sessionCapReached={sessionCapReached}
               onTavilyUsed={onTavilyUsed}
               loadingProfiles={loadingProfiles}
+              profiledCompanies={profiledCompanies}
             />
           )
         })}

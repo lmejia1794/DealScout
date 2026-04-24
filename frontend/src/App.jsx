@@ -693,6 +693,7 @@ export default function App() {
                 companies={displayResults.companies}
                 onViewProfile={handleViewProfile}
                 loadingProfiles={new Set(Object.keys(profileFetches))}
+                profiledCompanies={new Set(Object.keys(profiles))}
                 selectedCompanies={selectedCompanies}
                 onToggleCompany={toggleCompany}
                 companiesContext={displayResults._companies_context || ''}
