@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import VerificationBadge, { ConfidencePill } from './VerificationBadge'
 import LlmBadge from './LlmBadge'
+import CompanyLogo from './CompanyLogo'
 
 const stripCitations = (text) => (text || '')
   .replace(/[【\[]\s*SRC:[^\]】]*[】\]]/gi, '')
@@ -81,6 +82,7 @@ function ConferenceCard({ item, selected, onToggleSelect, conferencesContext, on
         <div className="flex items-start gap-2 min-w-0">
           <input type="checkbox" checked={selected} onChange={onToggleSelect}
             className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 cursor-pointer shrink-0" />
+          <CompanyLogo website={conf.website} name={conf.name} size="sm" />
           <div className="min-w-0">
             <h3 className="font-semibold text-gray-900 text-sm leading-tight">{stripCitations(conf.name)}</h3>
             <div className="flex items-center gap-1 mt-0.5 flex-wrap">
