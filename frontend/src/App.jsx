@@ -237,7 +237,7 @@ function ConfidenceSummaryBar({ results, tavilyCallsUsed, tavilyMax }) {
 // App
 // ---------------------------------------------------------------------------
 export default function App() {
-  const { jobs, activeJobId, activeJob, addJob, cancelJob, selectJob, patchJobResults } = usePipeline()
+  const { jobs, activeJobId, activeJob, addJob, cancelJob, removeJob, selectJob, patchJobResults } = usePipeline()
   const { settings } = useSettings()
   const navigate = useNavigate()
 
@@ -397,6 +397,7 @@ export default function App() {
   }
 
   const handleDelete = (id) => {
+    removeJob(id)
     setSavedSearches(prev => {
       const updated = prev.filter(s => s.id !== id)
       saveToDisk(updated)
