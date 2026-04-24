@@ -24,7 +24,8 @@
       "Bash(pkill -f \"uvicorn main:app\")",
       "Bash(npm run *)",
       "Bash(pip3 install *)",
-      "Bash(/Users/luismejia/Documents/dsail_project/backend/.venv/bin/pip install *)"
+      "Bash(/Users/luismejia/Documents/dsail_project/backend/.venv/bin/pip install *)",
+      "Bash(git *)"
     ]
   }
 }

@@ -1062,17 +1062,26 @@ IMPORTANT: Return ONLY plain markdown text. Do NOT return JSON, do NOT wrap the 
     def _brief_looks_valid(text: str) -> bool:
         t = text.strip()
         # Brief must have substantive content AND most of the 9 required sections.
-        # We require 7+ to allow slight variation (some models merge sections).
-        return len(t) >= 2000 and t.count('##') >= 7
+        # We require 5+ to allow Gemini merging adjacent sections; char count is the
+        # primary signal — a 10k+ char response with 5 headings is valid content.
+        return len(t) >= 2000 and t.count('##') >= 5
 
     if not _brief_looks_valid(result):
         _log(
             f"WARNING: sector brief looks invalid "
             f"({len(result.strip())} chars, {result.count('##')} sections) — retrying without search grounding"
         )
-        result = _strip_gemini_grounding_artifacts(
+        best_result = result  # preserve original in case retry is worse
+        retry_result = _strip_gemini_grounding_artifacts(
             _call_llm(prompt, BRIEF_TOKENS, log_fn=log_fn, use_search=False, settings=settings)
         )
+        if _brief_looks_valid(retry_result):
+            result = retry_result
+        elif len(retry_result.strip()) > len(best_result.strip()):
+            result = retry_result
+        else:
+            _log(f"WARNING: retry produced shorter brief ({len(retry_result.strip())} chars) — keeping original {len(best_result.strip())} chars")
+            result = best_result
         if not _brief_looks_valid(result) and _google_available():
             # Both attempts failed — escalate to gemini-2.5-flash
             current_model = (settings or {}).get("google_model", "")
@@ -1245,6 +1254,17 @@ def generate_companies(thesis: str, sector_brief: str, log_fn=None, extra_contex
         _log(f"Extracted size constraints from thesis — injecting into prompt")
     _log("Calling LLM for company universe...")
 
+    # Keep only the sections of the sector brief that are useful for company
+    # finding (up to and including Ideal Acquisition Target). Sections after
+    # that (Value Creation Levers, Exit Landscape, etc.) add bulk without
+    # helping identify targets, and a 15k-char full brief causes Gemini to
+    # truncate its JSON output early.
+    cutoff = sector_brief.find("## Value Creation Levers")
+    if cutoff != -1:
+        sector_brief_ctx = sector_brief[:cutoff].rstrip()
+    else:
+        sector_brief_ctx = sector_brief[:6000]  # fallback if structure differs
+
     prompt = f"""IMPORTANT — data hierarchy:
 Your output will be post-processed against authoritative company registries.
 Fields like founding year, legal name, and website will be overwritten by registry
@@ -1255,7 +1275,7 @@ Do not pad confidence on founding year or legal name — if uncertain, leave nul
 Investment thesis: {thesis}
 
 {size_constraints + chr(10) if size_constraints else ""}Sector brief context:
-{sector_brief}
+{sector_brief_ctx}
 
 {web_section}
 
@@ -1310,19 +1330,20 @@ Sort the array by fit_score descending before returning."""
             grounding_chunks = []  # retry had no grounding
         else:
             _log(f"Retry did not improve count ({len(retry)} vs {len(result)}) — keeping original")
-        # Still low — escalate to gemini-2.5-flash if not already on it
-        if len(result) < 6 and _google_available():
-            current_model = settings.get("google_model", "")
-            if "2.5" not in current_model:
-                _log(f"WARNING: still only {len(result)} companies — escalating to gemini-2.5-flash")
-                fs = {**settings, "google_model": "gemini-2.5-flash"}
-                retry_25 = _call_json(prompt, log_fn=log_fn, use_search=True, settings=fs)
-                if len(retry_25) > len(result):
-                    result = retry_25
-                    grounding_chunks = []
-                    _log(f"gemini-2.5-flash escalation succeeded ({len(result)} companies)")
-                else:
-                    _log(f"gemini-2.5-flash escalation did not improve — keeping {len(result)} companies")
+        # Still low — retry with a minimal prompt (no sector brief) to maximise
+        # the model's output budget for generating company JSON.
+        if len(result) < 6:
+            _log(f"WARNING: still only {len(result)} companies — retrying with minimal prompt")
+            minimal_prompt = prompt.replace(
+                f"Sector brief context:\n{sector_brief_ctx}", "Sector brief context: [omitted to save space]"
+            )
+            retry_minimal = _call_json(minimal_prompt, log_fn=log_fn, use_search=True, settings=settings)
+            if len(retry_minimal) > len(result):
+                result = retry_minimal
+                grounding_chunks = []
+                _log(f"Minimal-prompt retry succeeded ({len(result)} companies)")
+            else:
+                _log(f"Minimal-prompt retry did not improve — keeping {len(result)} companies")
     # Attach best-matching grounding URL to each company for the verification layer
     for company in result:
         if isinstance(company, dict):

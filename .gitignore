@@ -28,5 +28,6 @@ node_modules/
 # Debug logs
 backend/last_run.log
 
-# Claude Code local settings (machine-specific permissions)
+# Claude Code
 .claude/settings.local.json
+CLAUDE.md
