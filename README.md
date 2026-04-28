@@ -12,11 +12,13 @@ DealScout takes a plain-English investment thesis and returns a structured secto
 
 | Output | Description |
 |---|---|
-| **Sector Brief** | 11-section IC-ready memo covering market definition, size & growth, demand drivers, sub-sector breakdown, competitive landscape, M&A activity, ideal target profile, value creation levers, exit landscape, red flags, and key management questions |
+| **Sector Brief** | 11-section IC-ready memo: market definition, size & growth, demand drivers, sub-sector breakdown, competitive landscape, M&A activity, ideal target profile, value creation levers, exit landscape, red flags, and key management questions |
 | **Conference List** | 5–8 upcoming European sector events with dates, cost estimates, and notable attendees |
 | **Company Universe** | 8–12 ranked acquisition targets with fit scores, ownership status, ARR estimates, and growth signals |
 | **Company Profiles** | Deep-dive on any target: financials, decision-makers, verified facts, outreach email draft |
 | **Comparable Transactions** | Recent M&A comps with EV/ARR and EV/EBITDA multiples |
+| **Saved Searches** | Completed pipelines are auto-saved to localStorage and reloadable from the sidebar |
+| **Printable Report** | One-page IC-ready report combining sector brief, companies, and comparables — export via browser print-to-PDF |
 
 Every factual claim is sourced inline with a numbered citation. Citations are verified post-generation and flagged if hallucinated.
 
@@ -62,7 +64,7 @@ Investment thesis
 ┌─────────────────────────────────────────────────┐
 │  Step 1 — Sector Brief                          │
 │  Gemini 2.5 Flash + Google Search grounding     │
-│  → 9-section IC memo with inline citations      │
+│  → 11-section IC memo with inline citations     │
 └─────────────────────────────────────────────────┘
       │  (runs concurrently ↓)
       ├──────────────────────────────────────────────┐
@@ -285,22 +287,27 @@ dealscout/
 ├── frontend/
 │   └── src/
 │       ├── App.jsx               # Main state, search, saved searches
+│       ├── report.css               # Print/PDF report styles
 │       └── components/
 │           ├── SearchBar.jsx
+│           ├── WelcomePanel.jsx     # Onboarding panel with example theses and run CTAs
+│           ├── ServerWakeup.jsx     # Render cold-start detection and wakeup screen
 │           ├── SectorBrief.jsx      # Markdown renderer with citation footnotes
 │           ├── CompanyList.jsx
 │           ├── CompanyModal.jsx     # Deep-dive profile panel
+│           ├── CompanyLogo.jsx      # Company logo display
 │           ├── ConferenceGrid.jsx
 │           ├── ComparablesPanel.jsx
 │           ├── DecisionMakers.jsx
 │           ├── OutreachDraft.jsx
-│           ├── ReportView.jsx
+│           ├── ReportView.jsx       # Printable IC report view
 │           ├── ReportActionBar.jsx
 │           ├── ServiceMap.jsx
 │           ├── LlmBadge.jsx         # LLM attribution badge
 │           ├── VerificationBadge.jsx
 │           ├── PipelineContext.jsx  # Multi-job state management
 │           ├── SettingsContext.jsx
+│           ├── SettingsDrawer.jsx   # Settings panel UI
 │           └── SavedSearches.jsx
 ├── .env.example
 └── README.md
@@ -313,6 +320,7 @@ dealscout/
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/research` | POST | Full pipeline — streams SSE log + phase results |
+| `/api/research/jobs/{job_id}` | GET | Poll status and results for a running or completed job |
 | `/api/research/step` | POST | Regenerate one step (`sector_brief`, `conferences`, or `companies`) with current context |
 | `/api/company/profile` | POST | Deep-dive profile for a single company |
 | `/api/company/outreach` | POST | Generate personalised outreach email |
@@ -346,6 +354,8 @@ The frontend exposes a settings drawer (gear icon) with controls for:
 - [x] Phase 1 — Sector brief, conference list, company universe
 - [x] Phase 2 — Company deep-dive profiles, decision-maker identification, outreach drafts
 - [x] Phase 3 — Comparable M&A transactions panel
+- [x] Saved searches — auto-save to localStorage, reload from sidebar
+- [x] Print / PDF export — IC-ready report via browser print-to-PDF
 - [ ] CRM tracker — pipeline stage tracking across saved searches
-- [ ] PDF / Word export — IC-ready one-pager per company
+- [ ] Word export — formatted .docx one-pager per company
 - [ ] Webhook / scheduled refresh — re-run saved searches on a cadence
