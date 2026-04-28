@@ -630,7 +630,7 @@ export default function App() {
 
         {/* Welcome / onboarding — shown when idle with no results */}
         {!displayResults && !displayLoading && !displayError && displayLogs.length === 0 && (
-          <WelcomePanel onSelectExample={setPendingThesis} />
+          <WelcomePanel onSelectExample={setPendingThesis} onRunExample={handleSearch} />
         )}
 
         {/* Pipeline progress + logs */}

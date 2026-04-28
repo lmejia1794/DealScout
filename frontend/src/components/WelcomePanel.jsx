@@ -41,7 +41,7 @@ const STEPS = [
   },
 ]
 
-export default function WelcomePanel({ onSelectExample }) {
+export default function WelcomePanel({ onSelectExample, onRunExample }) {
   return (
     <div className="mt-10 space-y-10">
       {/* Value prop */}
@@ -68,17 +68,27 @@ export default function WelcomePanel({ onSelectExample }) {
 
       {/* Example theses */}
       <div>
-        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">Example theses — click to load</p>
+        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">Example theses</p>
         <div className="space-y-2">
           {EXAMPLES.map((ex) => (
-            <button
+            <div
               key={ex.thesis}
-              onClick={() => onSelectExample(ex.thesis)}
-              className="w-full text-left bg-white border border-gray-200 hover:border-blue-400 hover:bg-blue-50 rounded-lg px-4 py-3 transition-colors group"
+              className="bg-white border border-gray-200 rounded-lg px-4 py-3 flex items-center gap-3 group hover:border-blue-300 transition-colors"
             >
-              <span className="text-xs font-medium text-blue-600 group-hover:text-blue-700">{ex.label}</span>
-              <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{ex.thesis}</p>
-            </button>
+              <button
+                onClick={() => onSelectExample(ex.thesis)}
+                className="flex-1 min-w-0 text-left"
+              >
+                <p className="text-xs font-medium text-blue-600">{ex.label}</p>
+                <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{ex.thesis}</p>
+              </button>
+              <button
+                onClick={() => onRunExample(ex.thesis)}
+                className="shrink-0 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3 py-1.5 rounded-md transition-colors whitespace-nowrap"
+              >
+                Run Research →
+              </button>
+            </div>
           ))}
         </div>
       </div>
