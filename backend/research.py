@@ -47,7 +47,7 @@ SYSTEM_PROMPT = (
     "When asked to return markdown, return only markdown."
 )
 TEMPERATURE = 0.2
-JSON_TOKENS = 12000
+JSON_TOKENS = 16000
 BRIEF_TOKENS = 6000
 
 # Maximum characters of Tavily web context to inject per prompt.
@@ -807,6 +807,35 @@ def _escape_control_chars(text: str) -> str:
     return ''.join(result)
 
 
+def _trim_truncated_fields(items: list) -> None:
+    """
+    After json_repair recovers a truncated JSON array, the last item often has
+    string fields cut off mid-sentence. Trim each string field to the last
+    complete sentence (ending with . ! or ?) in-place.
+    """
+    sentence_end = re.compile(r'[.!?]')
+    text_fields = {'description', 'fit_rationale', 'ownership', 'estimated_arr', 'employee_count', 'founded'}
+    if not items:
+        return
+    last = items[-1]
+    if not isinstance(last, dict):
+        return
+    for key, val in last.items():
+        if key not in text_fields or not isinstance(val, str):
+            continue
+        val = val.strip()
+        if not val or sentence_end.search(val[-1]):
+            continue
+        # Find the last sentence-ending punctuation and cut there
+        match = None
+        for m in sentence_end.finditer(val):
+            match = m
+        if match:
+            last[key] = val[:match.end()].strip()
+        else:
+            last[key] = None  # no complete sentence at all — drop the field
+
+
 def _call_json(prompt: str, log_fn=None, use_search: bool = False, settings: dict = None, _grounding_chunks_collector: list = None) -> list:
     """
     Call the LLM expecting a JSON array. Retries once on parse failure.
@@ -838,6 +867,7 @@ def _call_json(prompt: str, log_fn=None, use_search: bool = False, settings: dic
                 repaired = repair_json(cleaned, return_objects=True)
                 if isinstance(repaired, list):
                     _log(f"JSON repaired ({len(repaired)} items recovered from truncated output)")
+                    _trim_truncated_fields(repaired)
                     return repaired
             except Exception:
                 pass
