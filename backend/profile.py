@@ -41,7 +41,7 @@ def _call_json_object(prompt: str, log_fn=None) -> dict:
 
     raw = _call_llm(
         prompt + "\n\nReturn ONLY a raw JSON object. Do not include ```json or any other text.",
-        2000,
+        6000,
         log_fn=log_fn,
     )
     def _parse(s):
@@ -68,7 +68,7 @@ def _call_json_object(prompt: str, log_fn=None) -> dict:
             + "\n\nYour previous response was not valid JSON. "
             "Return ONLY the raw JSON object with absolutely no other text."
         )
-        raw2 = _call_llm(retry_prompt, 2000, log_fn=log_fn)
+        raw2 = _call_llm(retry_prompt, 6000, log_fn=log_fn)
         return _parse(raw2)
 
 
